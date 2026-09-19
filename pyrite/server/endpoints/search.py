@@ -3,6 +3,7 @@
 import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
 from ...services.kb_service import KBService
 from ...services.search_service import SearchService
@@ -14,6 +15,7 @@ from ..api import (
     negotiate_response,
     requires_kb_read,
 )
+from ..projection import parse_fields_param, project_fields
 from ..schemas import SearchResponse, SearchResult
 
 router = APIRouter(tags=["Search"])
@@ -103,10 +105,13 @@ def search(
                     del remaining[k]
             results = grouped[:limit]
 
-        # Apply field projection or strip body
-        if fields:
-            fields_list = [f.strip() for f in fields.split(",")]
-            results = [{k: r[k] for k in fields_list if k in r} for r in results]
+        # Apply field projection or strip body. `project_fields` keeps the
+        # fields `SearchResult` requires, so `?fields=title` no longer fails
+        # validation with a raw dump (issue #179); the projected payload is
+        # returned directly so requested fields outside the model survive.
+        fields_list = parse_fields_param(fields)
+        if fields_list:
+            results = [project_fields(r, fields_list) for r in results]
         elif not include_body:
             for r in results:
                 r.pop("body", None)
@@ -115,6 +120,8 @@ def search(
         neg = negotiate_response(request, resp_data)
         if neg is not None:
             return neg
+        if fields_list:
+            return JSONResponse(content=resp_data)
         return SearchResponse(
             query=q, count=len(results), results=[SearchResult(**r) for r in results]
         )

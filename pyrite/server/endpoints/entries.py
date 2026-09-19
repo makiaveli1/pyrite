@@ -4,7 +4,7 @@ import io
 import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ...config import PyriteConfig
 from ...exceptions import (
@@ -26,6 +26,7 @@ from ..api import (
     requires_kb_read,
     requires_kb_tier,
 )
+from ..projection import parse_fields_param, project_fields
 from ..schemas import (
     CreateEntryRequest,
     CreateResponse,
@@ -656,14 +657,17 @@ def get_entry(
     result.setdefault("sources", [])
     result.setdefault("tags", [])
 
-    # Apply field projection
-    if fields:
-        fields_list = [f.strip() for f in fields.split(",")]
-        result = {k: result[k] for k in fields_list if k in result}
-        neg = negotiate_response(request, result)
+    # Apply field projection. `project_fields` keeps the fields
+    # `EntryResponse` requires, so `?fields=title` no longer 500s on response
+    # validation (issue #179); the projected payload is returned directly so
+    # requested fields outside the model survive too.
+    fields_list = parse_fields_param(fields)
+    if fields_list:
+        projected = project_fields(result, fields_list)
+        neg = negotiate_response(request, projected)
         if neg is not None:
             return neg
-        return result
+        return JSONResponse(content=projected)
 
     neg = negotiate_response(request, result)
     if neg is not None:
