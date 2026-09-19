@@ -5,10 +5,14 @@ For custom types defined in kb.yaml that don't match a core type.
 Custom fields live in self.metadata and round-trip through frontmatter.
 """
 
-from dataclasses import dataclass
+import logging
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 from .base import Entry
+
+logger = logging.getLogger(__name__)
 
 # Fields that are handled by Entry base or known frontmatter keys
 _KNOWN_KEYS = {
@@ -45,8 +49,13 @@ class GenericEntry(Entry):
 
     # Keys that arrived under an explicit nested `metadata:` block. Only these
     # are written back nested; undeclared top-level keys are promoted instead,
-    # so the same key can never be emitted twice (issue #149).
-    _nested_metadata_keys: frozenset[str] = frozenset()
+    # so the same key can never be emitted twice (issue #149). Private
+    # bookkeeping, declared like Entry's `_absent_default_keys` and
+    # `_source_frontmatter`: not a constructor argument, not compared, not in
+    # `repr`.
+    _nested_metadata_keys: frozenset[str] = field(
+        default=frozenset(), init=False, repr=False, compare=False
+    )
 
     @property
     def entry_type(self) -> str:
@@ -77,16 +86,31 @@ class GenericEntry(Entry):
     def from_frontmatter(cls, meta: dict[str, Any], body: str) -> "GenericEntry":
         kw = cls._base_kwargs(meta, body)
 
+        # `metadata:` is optional, but when the file carries it, it must be a
+        # mapping. A null or non-mapping value used to raise out of the merge
+        # below, which made the loader fall back to another entry class and save
+        # the file back as `type: event`.
+        raw_metadata = meta.get("metadata")
+        if "metadata" in meta and not isinstance(raw_metadata, Mapping):
+            logger.warning(
+                "%s %r: `metadata` frontmatter is %s, not a mapping; treating it as empty",
+                cls.__name__,
+                meta.get("id", ""),
+                type(raw_metadata).__name__,
+            )
+        explicit_metadata = dict(raw_metadata) if isinstance(raw_metadata, Mapping) else {}
+
         # Collect unknown frontmatter keys into metadata
-        explicit_metadata = meta.get("metadata", {}) or {}
         extra_metadata = {k: v for k, v in meta.items() if k not in _KNOWN_KEYS}
         # Merge: explicit metadata wins over inferred
         kw["metadata"] = {**extra_metadata, **explicit_metadata}
-        # Remember which of those keys were nested in the source, so
-        # to_frontmatter puts exactly them back nested and promotes the rest
-        # (#149).
-        kw["_nested_metadata_keys"] = frozenset(explicit_metadata)
 
         kw["lifecycle"] = meta.get("lifecycle", "active")
         kw["_entry_type"] = meta.get("type", "note")
-        return cls(**kw)
+        entry = cls(**kw)
+        # Remember which of those keys were nested in the source, so
+        # to_frontmatter puts exactly them back nested and promotes the rest
+        # (#149). Set after construction: it is private bookkeeping, not a field
+        # the YAML layer should fill (mirrors Entry's `_absent_default_keys`).
+        entry._nested_metadata_keys = frozenset(explicit_metadata)
+        return entry

@@ -658,6 +658,29 @@ class TestGenericEntryFrontmatterRoundTrip:
         assert first == second
         assert "metadata" not in first
 
+    @pytest.mark.parametrize("value", [None, "owner", ["owner"], 7, True])
+    def test_non_mapping_metadata_is_treated_as_empty(self, value):
+        """A non-mapping `metadata:` must not fail the load (review of #175).
+
+        On `dev` a null `metadata:` raised out of the merge, so the loader fell
+        back to another class and the file was saved back as `type: event`; a
+        string/list/number took the same path.
+        """
+        meta = {"id": "design-four", "type": "design", "title": "T", "metadata": value}
+
+        entry = GenericEntry.from_frontmatter(meta, "body")
+        out = entry.to_frontmatter()
+
+        assert entry.entry_type == "design"
+        assert "metadata" not in out, out
+
+    def test_empty_metadata_mapping_is_treated_as_empty(self):
+        meta = {"id": "design-five", "type": "design", "title": "T", "metadata": {}}
+
+        out = GenericEntry.from_frontmatter(meta, "body").to_frontmatter()
+
+        assert "metadata" not in out, out
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
