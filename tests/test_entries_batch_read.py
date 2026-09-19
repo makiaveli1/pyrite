@@ -109,3 +109,28 @@ def test_error_names_the_bad_position(rest_api_env, sample_events):
 
     assert resp.status_code == 400, resp.text
     assert "entries[2]" in resp.json()["detail"]["message"]
+
+
+@pytest.mark.parametrize("fields", [5, True, [["title"]], "title", [1], [None], [{"a": 1}]])
+def test_malformed_fields_is_a_structured_validation_error(rest_api_env, sample_events, fields):
+    """`fields` of the wrong type gets the same structured 400 as `entries` (#134 review)."""
+    kb = rest_api_env["events_kb"].name
+    present = sample_events[0]
+
+    resp = _batch(rest_api_env["client"], [{"entry_id": present.id, "kb_name": kb}], fields=fields)
+
+    assert resp.status_code == 400, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "VALIDATION_FAILED"
+    assert "fields" in detail["message"]
+
+
+def test_empty_fields_list_is_allowed(rest_api_env, sample_events):
+    """An empty `fields` list is valid and means \"no projection\" (all fields)."""
+    kb = rest_api_env["events_kb"].name
+    present = sample_events[0]
+
+    resp = _batch(rest_api_env["client"], [{"entry_id": present.id, "kb_name": kb}], fields=[])
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["found"] == 1

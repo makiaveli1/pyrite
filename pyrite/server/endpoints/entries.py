@@ -383,6 +383,20 @@ def batch_read_entries(
                 },
             )
 
+    # `fields`, like `entries`, is caller-supplied: a wrong type must be the same
+    # structured 400, not a 500 from the star-unpack below (#134 review).
+    if fields_param is not None and (
+        not isinstance(fields_param, list)
+        or any(not isinstance(field, str) for field in fields_param)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "VALIDATION_FAILED",
+                "message": "fields must be an array of strings",
+            },
+        )
+
     ids = [(e["entry_id"], e["kb_name"]) for e in entries_spec]
     if readable is not None:
         # Items in KBs the caller may not read are reported as not found.
