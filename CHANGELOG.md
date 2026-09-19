@@ -90,6 +90,15 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
 
 ### Process
 
+- CI parity: the `ruff check` / `ruff format --check` step now covers
+  `extensions/` (54 pre-existing findings fixed: import sorting, unused
+  imports/variables, a loop variable, two UP rules), matching the commit-stage
+  hook that already lints it — a PR could otherwise go green with lint debt a
+  local commit would have blocked. A new `pull_request`-only CI step runs
+  `check_fix_commit_has_tests.py --range` over the PR's own commit range, so a
+  `fix:` commit without a `tests/` change fails CI even for contributors who
+  never ran the local commit-msg hook (all three outside PRs so far were
+  fixes without tests). `tests/test_dev_process_config.py` pins both.
 - The weekly retrospective: `pyrite-meta-conductor` now says what worked,
   root-causes every failure in its window and fixes what it finds as one
   process change plus one `quality` theme (refactoring, test refactoring) the
@@ -201,9 +210,31 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   ~22 min → ~3-5 min. The one xdist-unsafe test (the task-claim race) now uses
   a start barrier and a single group deadline instead of per-process timeouts,
   which also makes it a real race rather than a sequence under load.
+- `social`, `zettelkasten` and `encyclopedia` relabelled as example plugins
+  (README, `docs/plugins.md`, `docs/getting-started.md`, each extension's new
+  `README.md`, `kb/components/*-extension.md`, `pyproject.toml`
+  `description`): reference code showing how a Pyrite plugin adds entry
+  types, CLI commands, MCP tools and a preset, not supported products.
+  Wording only — no package name, entry point, module path, preset name,
+  template name, CLI command name, MCP tool name or directory changed.
 
 ### Fixed
 
+- **Extension entry classes silently dropped `aliases` and `_schema_version` on
+  every load -> save round trip, and rewrote `importance` back to its default**
+  — a `writeup` (social), `zettel`/`literature_note` (zettelkasten), or
+  `article`/`talk_page` (encyclopedia) saved at `importance: 9` came back
+  `importance: 5` on the next save, because each class's `from_frontmatter`
+  hand-rolled its constructor call instead of routing through
+  `Entry._base_kwargs`, and `extra_frontmatter` could not rescue the loss since
+  all three keys are members of `_BASE_CONSUMED_KEYS`. All six classes now call
+  `cls._base_kwargs(meta, body)`; the same hand-rolled-copy pattern in
+  `cascade`, `journalism-investigation`, `software-kb` and
+  `pyrite/models/task.py` is deleted in favour of the one shared
+  implementation. A new registry-wide conformance test in
+  `tests/test_frontmatter_round_trip_all_types.py` parametrizes over every
+  registered entry type (core + every installed plugin) and pins the
+  guarantee for future types automatically.
 - **The REST `POST /entries/batch` endpoint now matches the MCP
   `kb_batch_read` contract.** A malformed spec returns a structured
   `VALIDATION_FAILED` (HTTP 400) naming `entries[i]` instead of a 500, and the
@@ -218,6 +249,17 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   `id` and `kb_name` in every projection (`kb_search`, `kb_get`,
   `kb_list_entries`, `kb_recent`, `kb_batch_read`), so the schema sentence is
   true of all five (#126, #137).
+- **A bare YAML date in frontmatter (`created_at: 2026-01-15`) read back as
+  the load time instead of the file's date.** The YAML parser produces a
+  `datetime.date` for a bare date, and `parse_datetime` only handled
+  `datetime`/`str`, so the value fell through to the "now" fallback. Bare
+  dates are now anchored to midnight UTC; naive ISO-8601 strings and naive
+  datetimes (an unquoted `created_at: 2026-01-15T09:00:00` loads as a naive
+  `TimeStamp`) are anchored to UTC as well, so comparisons against `_utcnow()`
+  cannot raise `TypeError`. Timestamps are indexed as strings, so an existing
+  KB may hold both `2026-01-15T09:00:00` and `2026-01-15T09:00:00+00:00` for
+  unchanged files until a full `pyrite index build` makes them uniform;
+  ordering and date filters are unaffected ("+" sorts before digits) (#151).
 - **Two worktrees running the Playwright e2e suite at once collided on the
   same four ports (8088/5173 base, 8189/5274 auth) and could end up talking
   to each other's world.** Ports and data directories are now derived per
