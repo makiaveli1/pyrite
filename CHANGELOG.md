@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pyrite index health` no longer reports a `subdirectory_mismatches` false
+  positive for every entry of a type whose declared subdirectory ends in `/`.**
+  `people/` and `people` are the same directory, but the check compared the
+  declared string against a path component, so a KB created exactly as the
+  getting-started guide instructs came back `status: warning` with one row per
+  entry. Both sides are normalized now, and an entry genuinely in the wrong
+  directory is still flagged (#44).
+
 ## [0.24.3] - 2026-09-20
 
 "Operational" — see `kb/roadmap.md`.
@@ -439,14 +449,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - CONTRIBUTING: how to claim an issue
 
 ### Fixed
-
-- **`pyrite index health` no longer reports a `subdirectory_mismatches` false
-  positive for every entry of a type whose declared subdirectory ends in `/`.**
-  `people/` and `people` are the same directory, but the check compared the
-  declared string against a path component, so a KB created exactly as the
-  getting-started guide instructs came back `status: warning` with one row per
-  entry. Both sides are normalized now, and an entry genuinely in the wrong
-  directory is still flagged (#44).
 
 - **The first write on a fresh install no longer blocks for over a minute
   downloading the embedding model (#13).** `KBService._auto_embed` took a
