@@ -260,10 +260,12 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   `metadata:` block the source file never had. Only keys that came from an
   explicit `metadata:` block stay nested now; the rest are promoted once
   (#149). A `metadata:` value that is not a mapping (null, a string, a list, a
-  number) is treated as empty with a warning instead of failing the load and
-  saving the file back as a different entry type. Deliberate behaviour change:
-  an entry *created* with `metadata={…}` now writes those keys top-level only,
-  where `dev` also wrote a nested block.
+  number) is kept verbatim and written back on the next save, with a warning,
+  instead of failing the load and saving the file back as a different entry
+  type. Deliberate behaviour change: an entry *created* with `metadata={…}` now
+  writes those keys top-level only, where `dev` also wrote a nested block --
+  except a key the base frontmatter already emits (`title`, `id`, …), which
+  stays nested under `metadata:` rather than being dropped.
 - **`kb_batch_read` no longer crashes on a malformed spec, and every `fields`
   projection keeps the identity pair.** A non-list `entries`, a non-object item,
   or a missing, empty or non-string `entry_id`/`kb_name` used to raise a raw

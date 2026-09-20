@@ -661,12 +661,14 @@ class TestGenericEntryFrontmatterRoundTrip:
         assert "metadata" not in first
 
     @pytest.mark.parametrize("value", [None, "owner", ["owner"], 7, True])
-    def test_non_mapping_metadata_is_treated_as_empty(self, value):
-        """A non-mapping `metadata:` must not fail the load (review of #175).
+    def test_non_mapping_metadata_is_kept_verbatim(self, value):
+        """A non-mapping `metadata:` is kept and written back (review of #175).
 
         On `dev` a null `metadata:` raised out of the merge, so the loader fell
         back to another class and the file was saved back as `type: event`; a
-        string/list/number took the same path.
+        string/list/number took the same path. Treating the value as empty for
+        `self.metadata` must not delete it from the file: it round-trips
+        verbatim through `_raw_metadata`.
         """
         meta = {"id": "design-four", "type": "design", "title": "T", "metadata": value}
 
@@ -674,7 +676,29 @@ class TestGenericEntryFrontmatterRoundTrip:
         out = entry.to_frontmatter()
 
         assert entry.entry_type == "design"
-        assert "metadata" not in out, out
+        assert entry.metadata == {}
+        assert out["metadata"] == value, out
+
+    def test_metadata_key_colliding_with_a_base_key_is_kept_nested(self):
+        """A metadata key that collides with a base key must not vanish (#149).
+
+        Built in memory, `_nested_metadata_keys` is empty, so the promotion path
+        used to run for every key and dropped the ones `_base_frontmatter`
+        already emitted. `title` here must survive somewhere rather than being
+        silently discarded.
+        """
+        entry = GenericEntry(
+            id="s1",
+            title="T",
+            body="b",
+            metadata={"title": "shadow", "status": "draft"},
+        )
+
+        out = entry.to_frontmatter()
+
+        assert out["title"] == "T"
+        assert out["status"] == "draft"
+        assert out["metadata"] == {"title": "shadow"}, out
 
     def test_empty_metadata_mapping_is_treated_as_empty(self):
         meta = {"id": "design-five", "type": "design", "title": "T", "metadata": {}}
