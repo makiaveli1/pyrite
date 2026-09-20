@@ -32,8 +32,10 @@ pre-commit install
 
 # Verify installation
 .venv/bin/pytest tests/ extensions/*/tests/ -q
-# Expected: ~4000 tests passing
 ```
+
+Pytest prints the current collected and passed test counts in its summary;
+they change as the project and extensions grow.
 
 See [Setting Up the Development Environment](kb/runbooks/setting-up-dev-environment.md) for troubleshooting.
 
@@ -114,7 +116,7 @@ pyrite/
 ## Testing
 
 ```bash
-# Everything, in parallel (~1 min). This is what the pre-push hook and CI run.
+# Everything, in parallel. This is what the pre-push hook and CI run.
 .venv/bin/pytest tests/ extensions/ -n auto
 
 # One file, or tests matching a pattern
@@ -131,6 +133,9 @@ that passes alone but fails under `-n auto` is a bug in that test (shared
 state, a fixed wall-clock timeout, an unclosed database), not a reason to run
 serially — `tests/test_task_claim_concurrency.py` shows the pattern for
 process-spawning tests.
+
+The full suite can take several minutes; runtime varies with available CPU
+cores and system load.
 
 **The runner itself is pinned.** `pytest`, `pytest-cov` and `pytest-xdist`
 are exact `==` pins in the `dev` extra (#128) — not a floor like the rest of
@@ -177,12 +182,29 @@ uv pip install --python .venv/bin/python -e ".[all,dev]"
 |---|---|---|
 | commit | ruff, formatting, file hygiene, import-cycle check, KB schema validation | seconds |
 | commit-msg | a `fix:` commit must touch `tests/` | — |
-| pre-push | `pytest tests/ extensions/ -n auto`, only when the push touches code or config | ~1 min |
+| pre-push | `pytest tests/ extensions/ -n auto`, only when the push touches code or config | Several minutes; varies by machine and load |
 
 CI runs the same checks plus the full Python matrix, Postgres, the frontend
 build and Playwright. `--no-verify` is for a documented emergency, not for a
 red test you did not write; if a test you did not touch fails, say so in the PR
 and we will look at it together.
+
+**Claiming an issue:** before you spend more than an hour on an issue, say so
+on the issue: two or three lines on how you'll fix it and what test proves
+it. A draft PR with that in the body is even better — we'll steer you there
+before you write much, and the draft is visible to everyone else looking at
+the issue. The plan scales with the change: for a `good first issue` one
+sentence is enough ("I'll add `id`/`kb_name` to the three projections and a
+test per command").
+
+A claim with no PR after 5 days lapses. Two people on one issue is fine — the
+first PR that meets the acceptance criteria merges, and we credit the other
+in the CHANGELOG line.
+
+A placeholder commit or file is not a claim, and we don't merge placeholders.
+
+Push as you go. A fix that exists only on your machine cannot be reviewed,
+and "it's in a local commit" has cost a round trip more than once.
 
 **Pull requests:**
 
@@ -227,8 +249,12 @@ the ones that arrived on 2026-09-18 from four first-time contributors all did:
 - The full suite green locally: `pytest tests/ extensions/ -n auto`, plus
   `ruff check` and `ruff format --check`.
 - A line in `CHANGELOG.md` under `[Unreleased]`.
-- If an AI coding agent wrote or co-wrote it, say so in the PR — it is
-  welcome, and it tells the reviewer what to look at first.
+- AI-assisted contributions are welcome here. If an AI coding agent wrote or
+  co-wrote your change, declare it with a `Co-authored-by:` trailer on the
+  commit (most agent tools add this automatically) — it is machine-readable,
+  it survives a squash-merge, and it is the form we'll look for first. A
+  mention in the PR body is welcome too, and helps the reviewer know what to
+  look at first, but it's optional on top of the trailer, not instead of it.
 
 What happens next: every outside PR gets a review within about an hour,
 posted as a comment with a plain recommendation (merge as is, merge after
@@ -248,7 +274,7 @@ names, for anything that is not yours to publish; no absolute home paths.
 
 - KB config: `kb.yaml` in each KB directory
 - Claude Code skill: `.claude/skills/pyrite-dev/SKILL.md`
-- Plugin developer guide: `kb/standards/plugin-developer-guide.md`
+- Plugin developer guide: `kb/notes/plugin-developer-guide.md`
 - Architecture docs: `kb/components/` and `kb/adrs/`
 
 ## Getting Help

@@ -178,6 +178,18 @@ def get_kb_service(
     return KBService(config, db)
 
 
+def _drain_embed_queue(db: PyriteDB, *, label: str = "") -> int:
+    """Embed everything a write left in `embed_queue`. Blocking; never raises.
+
+    Thin alias for `services.embedding_worker.settle_embed_queue`, which is
+    the single drain implementation the CLI shares. Kept as a name in this
+    module because the endpoints import it from here.
+    """
+    from ..services.embedding_worker import settle_embed_queue
+
+    return settle_embed_queue(db, label=label)
+
+
 def get_task_service(
     config: PyriteConfig = Depends(get_config),
     db: PyriteDB = Depends(get_db),
@@ -477,31 +489,124 @@ def requires_tier(tier: str):
     return _check_tier
 
 
-async def _resolve_kb_name(request: Request) -> str | None:
-    """Extract KB name from request via query params, path params, or body."""
-    # 1. Query param (used by DELETE, import, export)
-    kb = request.query_params.get("kb")
-    if kb:
-        return kb
+# The parameter names that name a knowledge base, in every location a
+# request can carry one. Pinned by tests/test_read_scoping_is_structural.py,
+# which fails if a handler declares a KB-bearing parameter outside this set.
+KB_PARAM_NAMES = ("kb", "kb_name")
 
-    # 2. Path param: /kbs/{name}/permissions (admin) or /kbs/{kb_name}/... (read)
-    name = request.path_params.get("name") or request.path_params.get("kb_name")
-    if name:
-        return name
 
-    # 3. Parse request body for "kb" / "kb_name"
+class _UnparseableBodyError(Exception):
+    """The request body could not be read or parsed, so the KBs it names are
+    unknown. Never treated as "names no KB": that would make a guard pass."""
+
+
+async def _resolve_kb_names(request: Request) -> list[str]:
+    """Every KB this request names, in every location it can name one.
+
+    Query parameters (`kb` and `kb_name` -- `reviews.py` binds
+    `Query(..., alias="kb_name")`, so the wire name differs from the
+    Python one), path parameters, and the JSON body's `kb`/`kb_name`.
+
+    **Every** value is returned, never just the first. A request that names
+    two KBs used to be checked against whichever spelling the resolver
+    happened to read first and served from the other -- `kb` checked,
+    `kb_name` served on the reviews routes; a `kb` query param checked, the
+    path's `kb_name` served on `/api/kbs/{kb_name}` and `/orient`. Callers
+    require *each* value to be permitted, which removes the whole class.
+
+    Order is preserved and duplicates removed, so the first value is still
+    a sensible single name for an error message.
+
+    Raises `_UnparseableBodyError` when a **JSON** body cannot be parsed:
+    "no KB named" is what lets a request through, so a body that was
+    supposed to carry a KB and could not be read must not produce it.
+
+    A body of any other content type is not read at all. Only a JSON object
+    can name a KB the way this resolver understands, and a multipart upload
+    (`/api/entries/import` binds `UploadFile = File(...)`) is consumed as a
+    stream by FastAPI, so reading it here raises
+    `RuntimeError("Stream consumed")` -- which is neither a malformed body
+    nor an attack, and those routes name their KB in the query string
+    anyway.
+    """
+    names: list[str] = []
+
+    def add(value: object) -> None:
+        if isinstance(value, str) and value and value not in names:
+            names.append(value)
+
+    # Path first: it is the route's own identity, the one location a caller
+    # cannot add or remove. Only `kb`/`kb_name`; `/plugins/{name}` and
+    # `/kbs/{name}` (admin) use `name` for other things, so `name` is read
+    # only where the route is a KB route -- see `_admin_kb_path_name` below.
+    for param in KB_PARAM_NAMES:
+        add(request.path_params.get(param))
+    add(_admin_kb_path_name(request))
+
+    for param in KB_PARAM_NAMES:
+        add(request.query_params.get(param))
+
+    if not _has_json_body(request):
+        return names
+
     try:
         body = await request.body()
-        if body:
-            import json
-
-            data = json.loads(body)
-            if isinstance(data, dict):
-                return data.get("kb") or data.get("kb_name")
-    except Exception:
+    except Exception as exc:
         logger.warning("Failed to extract KB from request body", exc_info=True)
+        raise _UnparseableBodyError() from exc
+    if body:
+        import json
 
-    return None
+        try:
+            data = json.loads(body)
+        except Exception as exc:
+            logger.warning("Failed to extract KB from request body", exc_info=True)
+            raise _UnparseableBodyError() from exc
+        if isinstance(data, dict):
+            for param in KB_PARAM_NAMES:
+                add(data.get(param))
+
+    return names
+
+
+def _has_json_body(request: Request) -> bool:
+    """Could this request's body be a JSON object naming a KB?
+
+    Anything else -- a multipart upload, a form post, no body at all -- is
+    left unread. The KB in those cases is in the path or the query, which
+    the caller has already collected.
+    """
+    content_type = request.headers.get("content-type", "")
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return media_type == "application/json" or media_type.endswith("+json")
+
+
+def _admin_kb_path_name(request: Request) -> str | None:
+    """The `{name}` path param, but only on routes where it names a KB.
+
+    `admin.py` declares `/kbs/{name}` and `/kbs/{name}/permissions`; it also
+    declares `/plugins/{name}`, where `name` is a plugin. Keying on the URL
+    path keeps the plugin routes from being treated as KB routes.
+    """
+    name = request.path_params.get("name")
+    if not name:
+        return None
+    return name if request.url.path.startswith("/api/kbs/") else None
+
+
+async def _resolve_kb_name(request: Request) -> str | None:
+    """The single KB this request names, for callers that genuinely need one.
+
+    Prefers the path parameter -- the route's own identity -- over a query
+    parameter, which a caller can add freely. Guards must use
+    `_resolve_kb_names` and check every value instead; this exists only for
+    call sites that need one name (an error message, a role lookup).
+    """
+    try:
+        names = await _resolve_kb_names(request)
+    except _UnparseableBodyError:
+        return None
+    return names[0] if names else None
 
 
 def resolve_kb_default_role(config: PyriteConfig, db: PyriteDB, kb_name: str) -> str | None:
@@ -532,6 +637,11 @@ async def resolve_effective_kb_role(
     `requires_tier`/`requires_kb_tier`; this helper is for call sites
     that need to check permissions inline without failing the request
     (e.g. deciding whether a GET is allowed to have a write side effect).
+
+    Resolves a **single** KB name when none is given, preferring the path
+    parameter. A caller that must cover every KB the request names --
+    `requires_kb_tier` does -- resolves them with `_resolve_kb_names` and
+    calls this once per name.
     """
     role = getattr(request.state, "api_role", None)
     if role is None:
@@ -557,8 +667,55 @@ async def resolve_effective_kb_role(
     return auth_service.get_kb_role(auth_user["id"], kb_name, kb_default_role)
 
 
+def readable_kbs_for_user(
+    config: PyriteConfig,
+    db: PyriteDB,
+    user_id: int | None,
+    role: str | None,
+    *,
+    scoped: bool = True,
+) -> set[str] | None:
+    """The KBs a caller may read, or None when the caller is not scoped.
+
+    The one rule, framework-free: no `Request`, so the MCP transport can
+    apply exactly what the REST routes apply. `readable_kbs()` below is a
+    thin Request-reading wrapper over it, and `mcp_routes._resolve_bearer_auth`
+    is the other caller. **Do not add a second implementation** -- two copies
+    drift, and a grant honoured on one surface but refused on the other is
+    the bug this whole shape exists to prevent (#201).
+
+    Not scoped (returns None): a global admin, and any caller with no user
+    identity to scope by -- an operator API key, or auth disabled entirely.
+    Callers that know the identity question is already settled pass
+    `scoped=False` to say so.
+
+    Scoped: `user_id` is resolved per KB through the same chain the REST
+    routes use (explicit grant → KB default_role → the user's global role),
+    and the KB is readable when that effective role is at least "read".
+    `user_id=None` with `scoped=True` is the anonymous visitor on an
+    auth-enabled instance: the same walk with no grants.
+    """
+    if role == "admin" or not scoped:
+        return None
+
+    from ..services.auth_service import AuthService
+
+    auth_service = AuthService(db, config.settings.auth)
+    result: set[str] = set()
+    for kb in config.all_kbs():
+        default_role = resolve_kb_default_role(config, db, kb.name)
+        effective = auth_service.get_kb_role(user_id, kb.name, default_role)
+        if effective is not None and TIER_LEVELS.get(effective, -1) >= TIER_LEVELS["read"]:
+            result.add(kb.name)
+    return result
+
+
 async def readable_kbs(request: Request, config: PyriteConfig, db: PyriteDB) -> set[str] | None:
     """The KBs this caller may read, or None when the caller is not scoped.
+
+    Request-reading wrapper over `readable_kbs_for_user`: it pulls the
+    identity off `request.state` and caches the answer on the request. The
+    rule itself lives in the helper, shared with the MCP transport.
 
     Not scoped: global admins, and API-key callers (an API key is the
     operator's credential, not a peer's). A logged-in user is scoped to the KBs
@@ -573,20 +730,14 @@ async def readable_kbs(request: Request, config: PyriteConfig, db: PyriteDB) -> 
     role = getattr(request.state, "api_role", None)
     auth_user = getattr(request.state, "auth_user", None)
     anonymous = getattr(request.state, "anonymous", False)
-    result: set[str] | None
-    if role == "admin" or (not auth_user and not anonymous):
-        result = None  # an operator API key, or auth disabled
-    else:
-        from ..services.auth_service import AuthService
-
-        auth_service = AuthService(db, config.settings.auth)
-        user_id = auth_user["id"] if auth_user else None
-        result = set()
-        for kb in config.all_kbs():
-            default_role = resolve_kb_default_role(config, db, kb.name)
-            effective = auth_service.get_kb_role(user_id, kb.name, default_role)
-            if effective is not None and TIER_LEVELS.get(effective, -1) >= TIER_LEVELS["read"]:
-                result.add(kb.name)
+    result = readable_kbs_for_user(
+        config,
+        db,
+        auth_user["id"] if auth_user else None,
+        role,
+        # An operator API key, or auth disabled: no user identity to scope by.
+        scoped=bool(auth_user or anonymous),
+    )
     request.state.readable_kbs = result
     return result
 
@@ -620,11 +771,17 @@ async def get_readable_kbs(
 
 
 def requires_kb_read():
-    """FastAPI dependency: the KB named by the request must be readable by the caller.
+    """FastAPI dependency: **every** KB named by the request must be readable.
 
     Read-side counterpart of requires_kb_tier("write"). Resolves the KB from
-    `kb` / `kb_name` in query, path or body. Routes that span KBs (no kb given)
-    filter with readable_kbs() instead.
+    `kb` / `kb_name` in query, path and body -- all of them, not the first
+    one found -- and 404s on any value the caller may not read. Naming a
+    readable KB alongside a private one therefore buys nothing.
+
+    Routes that span KBs (no kb given) filter with readable_kbs() instead.
+
+    Note for the AI router: the dependency reads the request body. Starlette
+    caches it on the request, so the handler's own body parsing is unaffected.
     """
 
     async def _check(
@@ -632,7 +789,17 @@ def requires_kb_read():
         config: PyriteConfig = Depends(get_config),
         db: PyriteDB = Depends(get_db),
     ):
-        await assert_kb_readable(request, config, db, await _resolve_kb_name(request))
+        try:
+            names = await _resolve_kb_names(request)
+        except _UnparseableBodyError:
+            # Fail closed: an unreadable body names an unknown set of KBs,
+            # and "names none" is what lets a request through.
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_BODY", "message": "Request body could not be parsed"},
+            ) from None
+        for name in names:
+            await assert_kb_readable(request, config, db, name)
 
     return _check
 
@@ -641,13 +808,17 @@ _UNSET = object()
 
 
 def requires_kb_tier(tier: str):
-    """FastAPI dependency factory: enforce minimum tier on a per-KB basis.
+    """FastAPI dependency factory: enforce a minimum tier on **every** KB named.
 
-    Resolution chain:
+    Resolution chain, per KB:
     1. Global admins always pass
     2. Explicit KB grant → KB default_role → user global role → anonymous tier
 
-    Falls back to global role check when KB name cannot be resolved.
+    Falls back to a global role check when the request names no KB.
+
+    The same rule as `requires_kb_read`, for the same reason: a request that
+    names two KBs gets the tier checked on both, so a caller cannot authorise
+    a write to KB A by naming writable KB B elsewhere in the request.
     """
 
     async def _check_kb_tier(
@@ -659,18 +830,25 @@ def requires_kb_tier(tier: str):
         if role is None:
             raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
-        effective_role = await resolve_effective_kb_role(request, config, db)
+        try:
+            kb_names = await _resolve_kb_names(request)
+        except _UnparseableBodyError:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "INVALID_BODY", "message": "Request body could not be parsed"},
+            ) from None
 
-        if effective_role is None or TIER_LEVELS.get(effective_role, -1) < TIER_LEVELS.get(
-            tier, 99
-        ):
-            kb_name = await _resolve_kb_name(request)
-            detail = (
-                f"Insufficient permissions on KB '{kb_name}': requires '{tier}' tier"
-                if kb_name
-                else f"Insufficient permissions: requires '{tier}' tier, your role is '{role}'"
-            )
-            raise HTTPException(status_code=403, detail=detail)
+        for kb_name in kb_names or [None]:
+            effective_role = await resolve_effective_kb_role(request, config, db, kb_name)
+            if effective_role is None or TIER_LEVELS.get(effective_role, -1) < TIER_LEVELS.get(
+                tier, 99
+            ):
+                detail = (
+                    f"Insufficient permissions on KB '{kb_name}': requires '{tier}' tier"
+                    if kb_name
+                    else f"Insufficient permissions: requires '{tier}' tier, your role is '{role}'"
+                )
+                raise HTTPException(status_code=403, detail=detail)
 
     return _check_kb_tier
 
@@ -838,6 +1016,30 @@ def create_app(config: PyriteConfig | None = None) -> FastAPI:
                     "Embedding model pre-warm failed or unavailable "
                     "(sentence-transformers not installed?)"
                 )
+
+    # ADR-0035: writes enqueue rather than embed, so anything written while
+    # this process -- or a previous one -- had no model is sitting in
+    # embed_queue. Draining it is what turns "eventually embedded" into
+    # "embedded".
+    #
+    # **Deliberately outside the `prewarm_embeddings` branch above.** That
+    # setting defaults to False, so gating the drain on it meant the default
+    # server (`auto_embed: true`, `prewarm_embeddings: false`) enqueued
+    # forever with only the admin-tier `POST /api/index/sync?wait=true` left
+    # to drain it -- every `--mode semantic` returning [] on a stock install,
+    # a straight functional loss against the synchronous behaviour ADR-0035
+    # replaced. Affordable unconditionally because `settle_embed_queue`
+    # checks `has_pending()` first: one indexed COUNT, and no EmbeddingService
+    # (so no torch) when there is nothing owed, which is the usual case.
+    #
+    # Still no background thread (#102): this runs in the startup threadpool,
+    # which the server already waits on before serving.
+    @application.on_event("startup")
+    async def _drain_embed_queue_on_startup() -> None:
+        from starlette.concurrency import run_in_threadpool
+
+        db = _app_get_db()
+        await run_in_threadpool(lambda: _drain_embed_queue(db, label="startup"))
 
     # CORS — use configured origins; disable credentials with wildcard (spec compliance)
     origins = config.settings.cors_origins
