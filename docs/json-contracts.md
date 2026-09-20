@@ -154,6 +154,51 @@ don't assume its absence means anything other than "not truncated".
 Use `kb_read_body` (offset-based continuation) to read past the first
 chunk; stop once `body_offset + body_chunk_size >= body_length`.
 
+The four keys survive a `fields` projection that kept `body`: a bounded
+body always arrives with the means to tell it was bounded (ADR-0034 rule
+2). A projection that excluded `body` carries none of them.
+
+### `body_chunk_size: 0` in a multi-entry read
+
+`kb_batch_read`, and the other tools that return several bodies, spend a
+per-response budget (`PYRITE_BODY_RESPONSE_BUDGET`, default 40,000
+characters) in request order. An entry reached after the budget is spent
+comes back **in place, with an empty body and the full marker**:
+
+```json
+{
+  "id": "some-entry",
+  "body": "",
+  "body_truncated": true,
+  "body_length": 50000,
+  "body_offset": 0,
+  "body_chunk_size": 0
+}
+```
+
+It is not dropped from `entries` and never appears in `not_found` —
+`body_length` is its true length, so a caller can see there was content
+and fetch it with `kb_read_body`. A loop that advances by
+`body_chunk_size` must treat `0` as "this call returned nothing, ask
+again for this entry alone" rather than incrementing by zero forever.
+
+### Writing a body back
+
+**A truncated body is never valid input to a write** (ADR-0034 rule 2).
+Every write path that can receive a body — MCP (`kb_create`, `kb_update`,
+`kb_bulk_create`, `task_create`, …), REST (`POST`/`PUT`/`PATCH
+/api/entries`, `POST /api/entries/import`) and the CLI (`pyrite create`,
+`pyrite update`, `pyrite import`) — refuses a request carrying a truthy
+`body_truncated` alongside a `body`, with `VALIDATION_FAILED` and
+`retryable: false`. Writing back what a bounded read returned would
+replace the whole stored body with the chunk you were given.
+
+Assemble the full body first (`kb_read_body` paged by `body_offset`, or a
+`body_limit` above `body_length`) and write that, without the marker. To
+change other fields without touching the body, omit `body` — a request
+carrying the marker but no body is allowed. `body_truncated: false` is
+allowed, and is never persisted as entry content.
+
 ## Exit codes (CLI)
 
 - `0` — success.

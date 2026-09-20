@@ -98,6 +98,14 @@ DEFAULT_REQUIRED_CHECKS = ("gate",)
 # fails immediately for a scripted check.
 DEFAULT_WAIT_CI_MINUTES = 15
 
+# The extras the release layer installs. This must match what
+# docs/getting-started.md tells a user to install, because step (c) then runs
+# that very tutorial against this install: `[server,cli]` omits
+# sentence-transformers, so the tutorial's `pyrite index embed` failed on a
+# release candidate that was fine -- the check was narrower than the document
+# it was checking.
+INSTALL_CHECK_EXTRAS = "all"
+
 CI_PASSED = "passed"
 CI_FAILED = "failed"
 CI_PENDING = "pending"
@@ -788,7 +796,7 @@ def step_release_layer(ctx: Context) -> None:
         return
 
     if not (ctx.runner.execute or ctx.rehearse_install_check):
-        spec = f"pyrite[server,cli] @ git+{REMOTE_URL}@{ctx.sha}"
+        spec = f"pyrite[{INSTALL_CHECK_EXTRAS}] @ git+{REMOTE_URL}@{ctx.sha}"
         print("    WOULD RUN: uv venv <tmp>")
         print(f'    WOULD RUN: uv pip install --python <tmp>/bin/python "{spec}"')
         print(f"    WOULD RUN: <tmp>/bin/pyrite --version    (must contain {ctx.version})")
@@ -808,7 +816,7 @@ def step_release_layer(ctx: Context) -> None:
         )
 
     venv = Path(tempfile.mkdtemp(prefix="pyrite-release-venv-"))
-    spec = f"pyrite[server,cli] @ git+{REMOTE_URL}@{ctx.sha}"
+    spec = f"pyrite[{INSTALL_CHECK_EXTRAS}] @ git+{REMOTE_URL}@{ctx.sha}"
     try:
         ctx.runner.note(f"temp venv: {venv}")
         print(f"    RUN: uv venv {venv}")
@@ -877,7 +885,11 @@ def _contributor_logins(since_tag: str | None) -> list[str]:
             "--base",
             "dev",
             "--search",
-            f"merged:>{merged_at[:10]}",
+            # Keep the time component. `merged:>2026-09-18` means "after that
+            # day ENDS", so truncating a published_at of 09-18T09:22Z to a bare
+            # date silently drops every PR merged earlier that same day -- two
+            # of them, when 0.24.3 was cut.
+            f"merged:>{merged_at}",
             "--limit",
             "200",
             "--json",
@@ -889,14 +901,45 @@ def _contributor_logins(since_tag: str | None) -> list[str]:
     return [pr.get("author", {}).get("login", "") for pr in prs]
 
 
-def _previous_tag(repo: Path) -> str | None:
+def _tag_is_released(repo: Path, tag: str) -> bool:
+    """Did `main` actually move to this tag?
+
+    Not "does a GitHub release exist": the accidental `v0.24.2` had one, empty
+    and unnamed. What makes a tag a release in this project is step (d) --
+    `main` fast-forwards to the commit. A tag `main` never reached names a
+    commit nobody was ever shipped.
+    """
     try:
-        return (
-            _check_output(["git", "-C", str(repo), "describe", "--tags", "--abbrev=0"]).strip()
-            or None
-        )
+        sha = _check_output(["git", "-C", str(repo), "rev-list", "-n1", tag]).strip()
+        if not sha:
+            return False
+        _check_output(["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, "origin/main"])
+        return True
+    except ReleaseError:
+        return False
+
+
+def _previous_tag(repo: Path, exclude: str | None = None) -> str | None:
+    """The newest tag `main` actually moved to, for the contributor window.
+
+    `git describe --tags --abbrev=0` returns the newest *tag*, which is not
+    the same thing. Cutting 0.24.3 it returned `v0.24.2` -- a tag pointing at
+    a mid-development commit whose own pyproject said 0.24.1, published with
+    an empty release by accident. An accidental tag is not a release
+    boundary, and anchoring the window to one moves it by an arbitrary amount.
+    """
+    try:
+        tags = _check_output(
+            ["git", "-C", str(repo), "tag", "--list", "v*", "--sort=-v:refname"]
+        ).splitlines()
     except ReleaseError:
         return None
+    for tag in (t.strip() for t in tags):
+        if not tag or tag == exclude:
+            continue
+        if _tag_is_released(repo, tag):
+            return tag
+    return None
 
 
 def step_publish(ctx: Context) -> None:
@@ -907,7 +950,7 @@ def step_publish(ctx: Context) -> None:
     no lease, no delete.
     """
     tag = f"v{ctx.version}"
-    logins = _contributor_logins(_previous_tag(ctx.repo))
+    logins = _contributor_logins(_previous_tag(ctx.repo, exclude=tag))
     ctx.notes = compose_notes(ctx.repo, ctx.version, logins)
     line = contributors_line(logins)
     ctx.runner.note(
