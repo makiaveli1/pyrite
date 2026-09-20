@@ -16,9 +16,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pyrite tags` and every tag-filtered view. Comma-separated lists, JSON arrays
   and objects, floats and booleans now parse identically on both write commands.
 
+- **`pyrite create -t <type>` no longer silently files a different type when the
+  KB does not declare the one asked for (#197).** Core types were exempt from
+  the CLI's write-side refusal, so `-t note` against a KB whose schema declares
+  only `adr | backlog_item | component | standard` skipped the guard, and plugin
+  type resolution then promoted it to its most-derived `note` subtype — an ADR
+  with `adr_number: 0` under `kb/adrs/`, from a command that asked for a note.
+  The refusal now covers every type the KB does not declare; `--allow-undeclared`
+  still overrides it.
+
 ## [0.24.3] - 2026-09-20
 
 "Operational" — see `kb/roadmap.md`.
+
+**The last release from `markramm/pyrite`.** The repository moves to the
+`pyrite-wiki` organization next, and 0.25 will be the first release from its
+new home. Eight of the 86 pull requests merged into this release came from
+outside contributors — @Voyagerroc-Lab, @YaoSong808, @fathirramadhan-web,
+@makiaveli1 and @zhongxiao-chang. That is 9%. Of the pull requests open as
+this release was cut, 11 of 13 are theirs.
+
+The move is not a rename. It is what makes pull request queues, contributor
+permissions and a home for community extensions possible — and the point at
+which Pyrite stops being one person's experiment.
+
+### Fixed
+
+- The `pyrite` CLI now configures the package logger at startup, so warnings
+  use the standard timestamped stderr format without tracebacks while JSON
+  stdout remains parseable. Library imports install only a `NullHandler` and
+  leave application and root logging configuration untouched (#196).
 
 ### Security
 
@@ -137,7 +164,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   routes, MCP over HTTP) are allowlisted pending the same treatment; they
   are tier-guarded today but not per-KB scoped.
 
+### Fixed
+
+- REST field projections now preserve `id` and `kb_name` (Berkay Byte).
+
 ### Added
+
+- **`pyrite --version` (also `-V`), which had never existed.** The CLI
+  answered `Error: No such option: --version` for every release up to this
+  one. The version itself was never wrong — `pyrite.__version__` reads from
+  `pyproject.toml` with an installed-metadata fallback, and a test has pinned
+  it since it drifted to `0.12.0` while `pyproject.toml` said `0.24.1`. That
+  test covered the package attribute; nothing covered the command line, which
+  is the surface a user meets first. Found by the release script's own
+  release-layer step on its first real run, against a clean install from the
+  release SHA.
 
 - **`scripts/release.py`: a release is one command.** Six ordered steps, with
   every check in front of the first thing that cannot be undone —
