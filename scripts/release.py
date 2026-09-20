@@ -30,8 +30,9 @@ change the world come after every check:
   c. release layer  -- what a *user* gets, checked before the tag exists:
                        install from the SHA into a fresh temp venv with `uv`,
                        `pyrite --version`, and the getting-started tutorial run
-                       against that install. Docker build if docker is there,
-                       a loud skip if not.
+                       against that install. The Docker build is OPT-IN
+                       (`--docker-check`): no image is published, so building
+                       one gated the release on an artifact nobody receives.
   d. publish        -- IRREVERSIBLE. Fast-forward `main` to the SHA, tag it,
                        push the tag, `gh release create` with the CHANGELOG
                        section plus the contributors line.
@@ -97,6 +98,14 @@ DEFAULT_REQUIRED_CHECKS = ("gate",)
 # covers the full matrix on dev (~3 min for one leg). `--wait-ci 0` still
 # fails immediately for a scripted check.
 DEFAULT_WAIT_CI_MINUTES = 15
+
+# The extras the release layer installs. This must match what
+# docs/getting-started.md tells a user to install, because step (c) then runs
+# that very tutorial against this install: `[server,cli]` omits
+# sentence-transformers, so the tutorial's `pyrite index embed` failed on a
+# release candidate that was fine -- the check was narrower than the document
+# it was checking.
+INSTALL_CHECK_EXTRAS = "all"
 
 CI_PASSED = "passed"
 CI_FAILED = "failed"
@@ -617,6 +626,7 @@ class Context:
     required_checks: tuple[str, ...] = DEFAULT_REQUIRED_CHECKS
     skip_install_check: bool = False
     rehearse_install_check: bool = False
+    docker_check: bool = False
     sha: str = ""
     notes: str = ""
 
@@ -788,12 +798,15 @@ def step_release_layer(ctx: Context) -> None:
         return
 
     if not (ctx.runner.execute or ctx.rehearse_install_check):
-        spec = f"pyrite[server,cli] @ git+{REMOTE_URL}@{ctx.sha}"
+        spec = f"pyrite[{INSTALL_CHECK_EXTRAS}] @ git+{REMOTE_URL}@{ctx.sha}"
         print("    WOULD RUN: uv venv <tmp>")
         print(f'    WOULD RUN: uv pip install --python <tmp>/bin/python "{spec}"')
         print(f"    WOULD RUN: <tmp>/bin/pyrite --version    (must contain {ctx.version})")
         print("    WOULD RUN: PYRITE_TUTORIAL_VENV=<tmp> scripts/run_tutorial.sh")
-        print(f"    WOULD RUN: docker build -t pyrite:{ctx.version} .    (if docker is present)")
+        if ctx.docker_check:
+            print(f"    WOULD RUN: docker build -t pyrite:{ctx.version} .")
+        else:
+            print("    (docker build skipped; pass --docker-check to build it)")
         ctx.runner.note(
             "pass --install-check to actually run this step in a dry run "
             "(minutes: a real install from GitHub plus the tutorial)"
@@ -808,7 +821,7 @@ def step_release_layer(ctx: Context) -> None:
         )
 
     venv = Path(tempfile.mkdtemp(prefix="pyrite-release-venv-"))
-    spec = f"pyrite[server,cli] @ git+{REMOTE_URL}@{ctx.sha}"
+    spec = f"pyrite[{INSTALL_CHECK_EXTRAS}] @ git+{REMOTE_URL}@{ctx.sha}"
     try:
         ctx.runner.note(f"temp venv: {venv}")
         print(f"    RUN: uv venv {venv}")
@@ -835,6 +848,16 @@ def step_release_layer(ctx: Context) -> None:
         ctx.runner.note("getting-started tutorial ran clean against the install")
     finally:
         shutil.rmtree(venv, ignore_errors=True)
+
+    if not ctx.docker_check:
+        ctx.runner.note(
+            "docker build not run (pass --docker-check to build it). Nothing "
+            "publishes the image: neither CI nor this script pushes to a "
+            "registry, so the build verified an artifact that never left the "
+            "machine -- while being able to fail a release, which it did twice "
+            "on 0.24.3."
+        )
+        return
 
     dockerfile = ctx.repo / "Dockerfile"
     if not shutil.which("docker"):
@@ -1156,6 +1179,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "when you have done the runbook's clean-venv check by hand.",
     )
     parser.add_argument(
+        "--docker-check",
+        action="store_true",
+        help="also build the Docker image in step c. Off by default: nothing "
+        "publishes the image, so the build gates a release on an artifact that "
+        "is never shipped. Turn it back on when images are published.",
+    )
+    parser.add_argument(
         "--install-check",
         action="store_true",
         help="in a dry run, actually perform step c instead of printing it. Takes "
@@ -1195,6 +1225,7 @@ def run_release(args: argparse.Namespace) -> tuple[int, Runner]:
         required_checks=tuple(args.require_check),
         skip_install_check=args.skip_install_check,
         rehearse_install_check=args.install_check,
+        docker_check=args.docker_check,
     )
 
     mode = "EXECUTE" if args.execute else "DRY RUN"

@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 "Operational" — see `kb/roadmap.md`.
 
+**The last release from `markramm/pyrite`.** The repository moves to the
+`pyrite-wiki` organization next, and 0.25 will be the first release from its
+new home. Eight of the 86 pull requests merged into this release came from
+outside contributors — @Voyagerroc-Lab, @YaoSong808, @fathirramadhan-web,
+@makiaveli1 and @zhongxiao-chang. That is 9%. Of the pull requests open as
+this release was cut, 11 of 13 are theirs.
+
+The move is not a rename. It is what makes pull request queues, contributor
+permissions and a home for community extensions possible — and the point at
+which Pyrite stops being one person's experiment.
+
 ### Security
 
 - **Private-KB content was readable over MCP-over-HTTP by any logged-in
@@ -139,6 +150,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are tier-guarded today but not per-KB scoped.
 
 ### Added
+
+- **`pyrite --version` (also `-V`), which had never existed.** The CLI
+  answered `Error: No such option: --version` for every release up to this
+  one. The version itself was never wrong — `pyrite.__version__` reads from
+  `pyproject.toml` with an installed-metadata fallback, and a test has pinned
+  it since it drifted to `0.12.0` while `pyproject.toml` said `0.24.1`. That
+  test covered the package attribute; nothing covered the command line, which
+  is the surface a user meets first. Found by the release script's own
+  release-layer step on its first real run, against a clean install from the
+  release SHA.
 
 - **`scripts/release.py`: a release is one command.** Six ordered steps, with
   every check in front of the first thing that cannot be undone —
