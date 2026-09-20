@@ -24,6 +24,20 @@ class OverlaySearchBackend:
         self._main = main
         self._diff = diff
 
+    @property
+    def capabilities(self) -> set[Any]:
+        """Whatever both halves can do.
+
+        The overlay is only as capable as its weaker half for anything it has
+        to combine, so the intersection is the honest answer. ``FILTERED_
+        SEMANTIC`` (#56) survives it because ``search_semantic`` delegates
+        straight to main with every filter passed through — main's guarantee
+        is the overlay's guarantee, and both in-tree backends declare it.
+        """
+        main = getattr(self._main, "capabilities", set()) or set()
+        diff = getattr(self._diff, "capabilities", set()) or set()
+        return set(main) & set(diff)
+
     def close(self) -> None:
         # Don't close main — it's shared. Only close diff.
         self._diff.close()
@@ -277,9 +291,13 @@ class OverlaySearchBackend:
 
     # ── tags → merge ────────────────────────────────────────────────
 
-    def get_all_tags(self, kb_name: str | None = None) -> list[tuple[str, int]]:
-        main_tags = dict(self._main.get_all_tags(kb_name))
-        diff_tags = dict(self._diff.get_all_tags(kb_name))
+    def get_all_tags(
+        self,
+        kb_name: str | None = None,
+        kb_names: set[str] | list[str] | None = None,
+    ) -> list[tuple[str, int]]:
+        main_tags = dict(self._main.get_all_tags(kb_name, kb_names=kb_names))
+        diff_tags = dict(self._diff.get_all_tags(kb_name, kb_names=kb_names))
         merged = dict(main_tags)
         for tag, count in diff_tags.items():
             merged[tag] = merged.get(tag, 0) + count
@@ -291,10 +309,11 @@ class OverlaySearchBackend:
         limit: int = 100,
         offset: int = 0,
         prefix: str | None = None,
+        kb_names: set[str] | list[str] | None = None,
     ) -> list[dict[str, Any]]:
         # Delegate to main for V1 — tag counts from diff are minimal
         return self._main.get_tags_as_dicts(
-            kb_name=kb_name, limit=limit, offset=offset, prefix=prefix
+            kb_name=kb_name, limit=limit, offset=offset, prefix=prefix, kb_names=kb_names
         )
 
     # ── timeline → delegate to main ─────────────────────────────────
@@ -308,6 +327,7 @@ class OverlaySearchBackend:
         limit: int = 50,
         offset: int = 0,
         sort_order: str = "asc",
+        kb_names: set[str] | list[str] | None = None,
     ) -> list[dict[str, Any]]:
         return self._main.get_timeline(
             date_from=date_from,
@@ -317,6 +337,7 @@ class OverlaySearchBackend:
             limit=limit,
             offset=offset,
             sort_order=sort_order,
+            kb_names=kb_names,
         )
 
     # ── embeddings → delegate to main ───────────────────────────────
@@ -330,9 +351,31 @@ class OverlaySearchBackend:
         kb_name: str | None = None,
         limit: int = 20,
         max_distance: float = 1.3,
+        entry_type: str | None = None,
+        tags: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        fips: str | None = None,
+        state: str | None = None,
+        status: str | None = None,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
-        # For V1, semantic search from main only
-        return self._main.search_semantic(embedding, kb_name, limit, max_distance)
+        # For V1, semantic search from main only. Filters pass straight through
+        # so the overlay honours them exactly as main does (#56).
+        return self._main.search_semantic(
+            embedding,
+            kb_name,
+            limit,
+            max_distance,
+            entry_type=entry_type,
+            tags=tags,
+            date_from=date_from,
+            date_to=date_to,
+            fips=fips,
+            state=state,
+            status=status,
+            include_archived=include_archived,
+        )
 
     def has_embeddings(self) -> bool:
         return self._main.has_embeddings()

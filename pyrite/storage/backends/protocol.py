@@ -131,8 +131,28 @@ class SearchBackend(Protocol):
         kb_name: str | None = None,
         limit: int = 20,
         max_distance: float = 1.3,
+        entry_type: str | None = None,
+        tags: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        fips: str | None = None,
+        state: str | None = None,
+        status: str | None = None,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
-        """KNN search over stored embeddings."""
+        """KNN search over stored embeddings, honouring the same filters as
+        :meth:`search`.
+
+        The filter set here is deliberately the keyword leg's filter set. A
+        hybrid search fuses the two legs, so a filter applied on only one of
+        them produces a result set that silently violates the caller's filter
+        (#56). An implementation that applies every filter it is given declares
+        :attr:`~.capabilities.BackendCapability.FILTERED_SEMANTIC`; one that
+        does not must leave it undeclared, and ``SearchService`` drops the
+        vector leg — naming the filters in ``warnings`` — rather than call it
+        with a filter it would ignore. Returning unfiltered rows is never
+        acceptable.
+        """
         ...
 
     def has_embeddings(self) -> bool:
@@ -228,8 +248,17 @@ class SearchBackend(Protocol):
 
     # ── tags ─────────────────────────────────────────────────────────
 
-    def get_all_tags(self, kb_name: str | None = None) -> list[tuple[str, int]]:
-        """Get all tags with counts."""
+    def get_all_tags(
+        self,
+        kb_name: str | None = None,
+        kb_names: set[str] | list[str] | None = None,
+    ) -> list[tuple[str, int]]:
+        """Get all tags with counts.
+
+        ``kb_names`` restricts the result to a set of KBs -- the caller's
+        readable set. ``None`` means unrestricted; an empty set means the
+        caller may read nothing and must match no rows.
+        """
         ...
 
     def get_tags_as_dicts(
@@ -238,6 +267,7 @@ class SearchBackend(Protocol):
         limit: int = 100,
         offset: int = 0,
         prefix: str | None = None,
+        kb_names: set[str] | list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Get tags with counts as dicts."""
         ...
@@ -253,6 +283,7 @@ class SearchBackend(Protocol):
         limit: int = 50,
         offset: int = 0,
         sort_order: str = "asc",
+        kb_names: set[str] | list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Get timeline events ordered by date."""
         ...

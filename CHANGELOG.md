@@ -28,10 +28,26 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   `changes` job for `dorny/paths-filter`) instead of running with the
   repository's default `GITHUB_TOKEN` scope. Closes the eight CodeQL
   `actions/missing-workflow-permissions` alerts on `ci.yml`.
+- **Repo endpoints returned raw git stderr in their *error* bodies, disclosing
+  the server's absolute filesystem paths to any write-tier caller.** `POST
+  /api/repos/subscribe` on a missing repo answered `400 {"message": "Clone
+  failed: Cloning into '/Users/<user>/.pyrite/repos/…'…"}`; `/api/repos/fork`
+  and `/api/repos/{name}/pr` had the same shape, and `/api/repos/{name}/sync`
+  nested the same text in a 200 body. Every such message is now redacted —
+  absolute paths (including ones containing spaces, `~` and Windows drive
+  paths) replaced with `<path>`, tokens with `***` — while the full stderr is
+  logged at WARNING so the operator loses nothing (CodeQL
+  `py/stack-trace-exposure` #51, #52, #53). Clone failures are additionally
+  classified into stable, documented codes (`REPO_NOT_FOUND`, `AUTH_REQUIRED`,
+  `BRANCH_NOT_FOUND`, `PATH_EXISTS`, `CLONE_TIMEOUT`, `INVALID_REQUEST`,
+  falling back to `CLONE_FAILED`); see `docs/json-contracts.md`. Pull and push
+  keep returning git's own words, redacted — a merge conflict or a rejected
+  push still says so, and remote URLs the caller supplied are preserved.
+  Success bodies (`RepoInfo.local_path`, `subscribe`'s `path`) still carry
+  absolute server paths; narrowing those is separate work.
 - **Private KBs were readable by any logged-in user, and by anonymous
   visitors on an auth-enabled instance.** Per-KB roles (`default_role: none`,
-  explicit grants) were enforced on write routes only; every read route —
-  entry by id, list, search, batch read, graph, export, KB info/schema/orient —
+  explicit grants) were enforced on write routes only; every read route
   returned private content, and search and the KB list disclosed it. Read
   routes now require read on the named KB (404, so a private KB's existence is
   not disclosed either) and cross-KB routes are filtered to the KBs the caller
@@ -39,8 +55,68 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   unaffected (they are the operator's credential). MCP is operator-level and
   unchanged.
 
+  Every route serving KB content is now covered. The first pass reached
+  entry by id, list, search, batch read, graph, export and KB
+  info/schema/orient; a second pass reached the sixteen endpoint modules
+  it had missed — `/tags` and `/tags/tree` (a tag name and its count
+  disclose a KB), `/timeline`, `/qa/status`, `/qa/validate`,
+  `/qa/validate/{entry_id}`, `/qa/coverage`, both `/entries/{id}/versions`
+  routes, `/entries/{id}/blocks`, `/daily/dates` and `/daily/{date}`, all
+  four `/collections` reads, `/tasks`, `/starred`, the three
+  `/kbs/{kb}/templates*` routes, the three `/reviews` reads, and the four
+  `/ai/*` POSTs, whose retrieval now only sees readable KBs. Where a
+  route spans KBs the filter is pushed into the query, so `count`,
+  `total` and `limit` are computed over readable rows only — a count of
+  three for a KB you cannot read is itself a disclosure.
+
+  **A request that names a knowledge base in more than one place is now
+  checked against every one of them.** A request can name a KB in its path,
+  in either of two query spellings (`kb`, `kb_name`) and in its JSON body,
+  and the permission check used to stop at the first place it looked while
+  the handler read a different one — so pairing a knowledge base you may
+  read with one you may not could return the second one's content, or
+  authorise a write to it. Every KB a request names must now be permitted:
+  readable for a read route, and at the required tier for a write route.
+  A request whose body cannot be parsed is refused rather than treated as
+  naming no KB at all.
+
+  `GET /api/kbs/{kb}/changes`, which returns uncommitted entry-level diffs,
+  now requires read access to that KB as well as the global read tier.
+
+  `tests/test_read_scoping_is_structural.py` now enforces this: it walks
+  the real app's routes and fails for any `/api` route that declares no
+  read-scoping dependency and is not on an explicit allowlist where every
+  entry carries a reason — and, since a declared check is not the same as a
+  check that looked in the right place, it also fails any scoped route that
+  reads its KB from somewhere the resolver does not inspect. A new unscoped
+  route fails CI with instructions. Meta and admin surfaces (`/stats`,
+  `/plugins*`, `/settings*`, `/repos*`, `/worktree*`, the remaining git-ops
+  routes, MCP over HTTP) are allowlisted pending the same treatment; they
+  are tier-guarded today but not per-KB scoped.
+
 ### Added
 
+- **`scripts/release.py`: a release is one command.** Six ordered steps, with
+  every check in front of the first thing that cannot be undone —
+  preconditions (clean `dev` at `origin/dev`; `origin` really being the repo
+  the `gh` calls name; `vX.Y.Z` existing neither locally, on `origin`, nor as
+  a GitHub release, and `origin/main` already an ancestor of the SHA, so the
+  publish can only ever fast-forward; the version; a dated CHANGELOG section
+  with content; the `release-blocker` label existing, with no open PR carrying
+  it), the required CI checks green on that exact SHA (newest run per check
+  name, so a rerun to green counts; `--wait-ci` waits, 15 minutes by default),
+  the release layer verified *before* the tag exists (install from the SHA
+  into a throwaway venv, `pyrite --version`, the getting-started tutorial run
+  against that install, a Docker build when docker is present), then `main`,
+  the tag and the GitHub release, then reopening `[Unreleased]` on its own
+  branch for a PR to `dev`, then a handoff step naming what the release cannot
+  do. `--dry-run` is the default and prints every command, writing nothing to
+  disk; `--execute` is the only way anything is written. It never passes
+  `--no-verify`, never force-pushes, never deletes a ref and never creates a
+  label. A failure after the publish step began lists which commands already
+  ran rather than claiming nothing was attempted.
+  `scripts/run_tutorial.sh` gains `PYRITE_TUTORIAL_VENV` so the tutorial can
+  be run against an arbitrary install rather than the checkout's.
 - Repo-local configuration: a `.pyrite/config.yaml` in the current directory
   or any parent is used instead of `~/.pyrite` when no `PYRITE_CONFIG_DIR` /
   `PYRITE_DATA_DIR` is set, so a checkout (or a git worktree) can carry its own
@@ -150,6 +226,18 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
 
 ### Changed
 
+- Three open process findings fixed: `.claude/THEME.md` is no longer tracked
+  (it was gitignored but the already-committed blob kept riding every branch,
+  risking add/add conflicts — #122); `scripts/verify-red.sh` now refuses
+  (exit 2) when a reverted production file's top-level package resolves
+  outside the worktree's interpreter, so a review worktree with a symlinked
+  `.venv` can no longer report a suite number measured against the wrong
+  checkout — #189; and the PR gate's `changes` classifier gained an `infra`
+  output that widens the `test` job's matrix to all three interpreters when a
+  PR touches test infrastructure (`conftest.py`, `pyproject.toml`,
+  `.pre-commit-config.yaml`, `ci.yml`, `scripts/*`), so a change whose
+  behaviour is a property of the interpreter — like #81's `@classmethod`
+  fixtures — can't merge green on 3.12 and redden `dev` on 3.13 — #133.
 - `web/` dependency bumps (supersedes Dependabot PRs #23-#29, one reviewable
   change): `@sveltejs/kit` 2.53.0→2.70.3 (security fixes — CSRF protection on
   non-production `NODE_ENV` builds, prototype pollution in file-input
@@ -235,6 +323,7 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   types, CLI commands, MCP tools and a preset, not supported products.
   Wording only — no package name, entry point, module path, preset name,
   template name, CLI command name, MCP tool name or directory changed.
+- CONTRIBUTING: how to claim an issue
 
 ### Fixed
 
@@ -294,6 +383,35 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   `strictPort: true` — a taken 5173 is a startup error instead of silently
   moving to 5174, which is the same silent-fallback problem this fix exists
   to close, just visible outside the e2e path too.
+- **Search filters were silently ignored in semantic and hybrid modes — and
+  hybrid is the default.** `entry_type`, `tags`, `state`, `fips` and `status`
+  were compiled only into the keyword leg's `WHERE`; the vector leg ran with
+  `kb_name` alone and the two were fused, so a filtered search returned
+  plausible-looking entries the filter excluded (`--type mechanism` returning
+  themes; a bogus type returning a full result set instead of zero). Every
+  filter is now applied on every leg in every mode: `SearchBackend.search_semantic`
+  takes the keyword leg's filter set, and all backends implement it — SQLite
+  escalates sqlite-vec's KNN budget so a selective filter costs no recall,
+  Postgres puts the predicates in the same `WHERE` as the distance ordering.
+  The backend conformance suite gained the semantic-filter cases. When a leg
+  cannot honour a filter it is dropped rather than returning unfiltered rows,
+  and the response carries a `warnings` array naming the filters responsible
+  (`GET /api/search` and MCP `kb_search`; on stderr for the CLI) — absent, never
+  null, when everything was applied, so a caller tests for the key. Whether a
+  backend can filter its vector leg is a declared capability
+  (`BackendCapability.FILTERED_SEMANTIC`), not a probe: an earlier draft
+  inferred it from a `TypeError`, which turned any genuine bug inside the
+  vector leg into a silently dropped one. The archived-entry exclusion counts
+  as a filter and now holds on the vector leg too. `limit` is validated at the
+  service boundary rather than failing as a `TypeError` or a SQLite error deep
+  inside a leg. Two notes for operators: SQLite's KNN escalation is capped at
+  sqlite-vec's hard ceiling of `k = 4096`, so on an index larger than that a
+  filter selective enough to exclude the 4096 nearest neighbours under-returns
+  on the vector leg (best-effort recall — the keyword leg has no such ceiling
+  and carries hybrid); and the `kb_names` permission allowlist remains a Python
+  post-filter (`SearchService._restrict`) rather than a backend predicate,
+  unchanged by this work and correct, since it over-fetches before restricting.
+  Fixes #56, #53.
 - **The New Entry page's Create button could submit before the target KB was
   known.** `kbStore.activeKB` resolves asynchronously on mount; nothing
   disabled Create while it was still empty, so a fast click sent `kb: ''` and

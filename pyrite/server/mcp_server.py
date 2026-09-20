@@ -319,6 +319,11 @@ class PyriteMCPServer:
         limit = args.get("limit", 20)
         fields = args.get("fields")
         include_body = args.get("include_body", False)
+        # Anything the search could not do as asked lands here; omitted from the
+        # response when empty so the happy path costs an agent no tokens, and so
+        # an agent can test for the key's presence. See SearchService.search's
+        # docstring, "what a search response owes its caller" (#56).
+        warnings: list[str] = []
         try:
             results = self.search_svc.search(
                 query=query,
@@ -334,6 +339,7 @@ class PyriteMCPServer:
                 fips=args.get("fips"),
                 state=args.get("state"),
                 status=args.get("status"),
+                warnings=warnings,
             )
         except QuerySyntaxError as e:
             # Deterministic, not retryable — _dispatch_tool's catch-all
@@ -357,12 +363,15 @@ class PyriteMCPServer:
             for r in results:
                 r.pop("body", None)
 
-        return {
+        payload: dict[str, Any] = {
             "query": query,
             "count": len(results),
             "has_more": len(results) == limit,
             "results": results,
         }
+        if warnings:
+            payload["warnings"] = warnings
+        return payload
 
     def _kb_get(self, args: dict[str, Any]) -> dict[str, Any]:
         """Get entry by ID."""
