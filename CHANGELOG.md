@@ -7,9 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
+### Fixed
+
+- **A `GenericEntry` no longer duplicates its undeclared frontmatter keys into
+  a `metadata:` block on save.** `Entry._base_frontmatter` serialized the whole
+  `self.metadata` mapping as a nested block while `GenericEntry.to_frontmatter`
+  also promoted the same keys to top level, so a no-op load→save grew a
+  `metadata:` block the source file never had. Only keys that came from an
+  explicit `metadata:` block stay nested now; the rest are promoted once
+  (#149). A `metadata:` value that is not a mapping (null, a string, a list, a
+  number) is kept verbatim and written back on the next save, with a warning,
+  instead of failing the load and saving the file back as a different entry
+  type. Deliberate behaviour change: an entry *created* with `metadata={…}` now
+  writes those keys top-level only, where `dev` also wrote a nested block --
+  except a key the base frontmatter already emits (`title`, `id`, …), which
+  stays nested under `metadata:` rather than being dropped.
+
+- **`pyrite create -t <type>` no longer silently files a different type when the
+  KB does not declare the one asked for (#197).** Core types were exempt from
+  the CLI's write-side refusal, so `-t note` against a KB whose schema declares
+  only `adr | backlog_item | component | standard` skipped the guard, and plugin
+  type resolution then promoted it to its most-derived `note` subtype — an ADR
+  with `adr_number: 0` under `kb/adrs/`, from a command that asked for a note.
+  The refusal now covers every type the KB does not declare; `--allow-undeclared`
+  still overrides it.
+
+## [0.24.3] - 2026-09-20
+
+"Operational" — see `kb/roadmap.md`.
+
+**The last release from `markramm/pyrite`.** The repository moves to the
+`pyrite-wiki` organization next, and 0.25 will be the first release from its
+new home. Eight of the 86 pull requests merged into this release came from
+outside contributors — @Voyagerroc-Lab, @YaoSong808, @fathirramadhan-web,
+@makiaveli1 and @zhongxiao-chang. That is 9%. Of the pull requests open as
+this release was cut, 11 of 13 are theirs.
+
+The move is not a rename. It is what makes pull request queues, contributor
+permissions and a home for community extensions possible — and the point at
+which Pyrite stops being one person's experiment.
+
+### Fixed
+
+- The `pyrite` CLI now configures the package logger at startup, so warnings
+  use the standard timestamped stderr format without tracebacks while JSON
+  stdout remains parseable. Library imports install only a `NullHandler` and
+  leave application and root logging configuration untouched (#196).
 
 ### Security
+
+- **Private-KB content was readable over MCP-over-HTTP by any logged-in
+  user.** The `/mcp` mount resolved a global tier from the caller's
+  credential and applied no per-KB read scoping anywhere in its path — the
+  one KB-content surface the REST-side fix did not reach. A plain read-tier
+  user could read entry **bodies** from a KB they had no grant on: `kb_get`,
+  `kb_read_body`, `kb_list_entries` and `kb_search` all served it, and
+  `kb_list` named the KB. MCP now resolves the caller's readable set per
+  connection, through the same helper the REST routes use, and enforces it
+  at all three content chokepoints: tool dispatch, resources and prompts. A
+  KB the caller may not read is reported exactly as one that does not exist,
+  so its existence stays private. Anonymous callers were never exposed —
+  `/mcp` already rejected them. Operator API keys, global admins and local
+  stdio are unscoped, unchanged. Tools that span every KB and cannot yet
+  filter (45 extension tools taking an *optional* `kb_name`) are refused for
+  a scoped caller rather than served across the whole index; naming a
+  readable KB makes them work as before.
+  ([#201](https://github.com/markramm/pyrite/issues/201))
 
 - **`web/` dependency bump closes 16 of 19 open Dependabot alerts.** `vite`
   7.3.1 → 7.3.6 (range pinned to `^6.0.0 || ^7.3.5` so it cannot resolve
@@ -28,10 +91,40 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   `changes` job for `dorny/paths-filter`) instead of running with the
   repository's default `GITHUB_TOKEN` scope. Closes the eight CodeQL
   `actions/missing-workflow-permissions` alerts on `ci.yml`.
+- **Repo endpoints returned raw git stderr in their *error* bodies, disclosing
+  the server's absolute filesystem paths to any write-tier caller.** `POST
+  /api/repos/subscribe` on a missing repo answered `400 {"message": "Clone
+  failed: Cloning into '/Users/<user>/.pyrite/repos/…'…"}`; `/api/repos/fork`
+  and `/api/repos/{name}/pr` had the same shape, and `/api/repos/{name}/sync`
+  nested the same text in a 200 body. Every such message is now redacted —
+  absolute paths (including ones containing spaces, `~` and Windows drive
+  paths) replaced with `<path>`, tokens with `***` — while the full stderr is
+  logged at WARNING so the operator loses nothing (CodeQL
+  `py/stack-trace-exposure` #51, #52, #53). Clone failures are additionally
+  classified into stable, documented codes (`REPO_NOT_FOUND`, `AUTH_REQUIRED`,
+  `BRANCH_NOT_FOUND`, `PATH_EXISTS`, `CLONE_TIMEOUT`, `INVALID_REQUEST`,
+  falling back to `CLONE_FAILED`); see `docs/json-contracts.md`. Pull and push
+  keep returning git's own words, redacted — a merge conflict or a rejected
+  push still says so, and remote URLs the caller supplied are preserved.
+  Success bodies (`RepoInfo.local_path`, `subscribe`'s `path`) narrowed to
+  the workspace-relative form in the entry below.
+- **Repo endpoint *success* bodies disclosed the same absolute server paths
+  #161 removed from error bodies.** `RepoInfo.local_path` (`GET /repos`, `GET
+  /repos/{name}`) and the `path` key in `subscribe`/`fork` responses returned
+  the server's real filesystem path (`/Users/<user>/.pyrite/repos/owner/repo`)
+  at 200. Both are now relative to the workspace root (`owner/repo_name`) —
+  the field stays populated rather than dropped, since `RepoInfo` is public
+  REST response shape an external consumer may already read, but discloses
+  no server layout or usernames; a path outside the workspace root comes back
+  as `"<path>"` rather than leaking the absolute value or raising. Only the
+  HTTP boundary changed — the CLI (`pyrite repo list`/`status`) still shows
+  the real absolute path for the local operator, and every internal caller
+  (fork's `add_remote`, sync, PR, config load) still reads `local_path`
+  absolute off the DB row or the service's own dict, unaffected. See
+  `docs/json-contracts.md`.
 - **Private KBs were readable by any logged-in user, and by anonymous
   visitors on an auth-enabled instance.** Per-KB roles (`default_role: none`,
-  explicit grants) were enforced on write routes only; every read route —
-  entry by id, list, search, batch read, graph, export, KB info/schema/orient —
+  explicit grants) were enforced on write routes only; every read route
   returned private content, and search and the KB list disclosed it. Read
   routes now require read on the named KB (404, so a private KB's existence is
   not disclosed either) and cross-KB routes are filtered to the KBs the caller
@@ -39,8 +132,82 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   unaffected (they are the operator's credential). MCP is operator-level and
   unchanged.
 
+  Every route serving KB content is now covered. The first pass reached
+  entry by id, list, search, batch read, graph, export and KB
+  info/schema/orient; a second pass reached the sixteen endpoint modules
+  it had missed — `/tags` and `/tags/tree` (a tag name and its count
+  disclose a KB), `/timeline`, `/qa/status`, `/qa/validate`,
+  `/qa/validate/{entry_id}`, `/qa/coverage`, both `/entries/{id}/versions`
+  routes, `/entries/{id}/blocks`, `/daily/dates` and `/daily/{date}`, all
+  four `/collections` reads, `/tasks`, `/starred`, the three
+  `/kbs/{kb}/templates*` routes, the three `/reviews` reads, and the four
+  `/ai/*` POSTs, whose retrieval now only sees readable KBs. Where a
+  route spans KBs the filter is pushed into the query, so `count`,
+  `total` and `limit` are computed over readable rows only — a count of
+  three for a KB you cannot read is itself a disclosure.
+
+  **A request that names a knowledge base in more than one place is now
+  checked against every one of them.** A request can name a KB in its path,
+  in either of two query spellings (`kb`, `kb_name`) and in its JSON body,
+  and the permission check used to stop at the first place it looked while
+  the handler read a different one — so pairing a knowledge base you may
+  read with one you may not could return the second one's content, or
+  authorise a write to it. Every KB a request names must now be permitted:
+  readable for a read route, and at the required tier for a write route.
+  A request whose body cannot be parsed is refused rather than treated as
+  naming no KB at all.
+
+  `GET /api/kbs/{kb}/changes`, which returns uncommitted entry-level diffs,
+  now requires read access to that KB as well as the global read tier.
+
+  `tests/test_read_scoping_is_structural.py` now enforces this: it walks
+  the real app's routes and fails for any `/api` route that declares no
+  read-scoping dependency and is not on an explicit allowlist where every
+  entry carries a reason — and, since a declared check is not the same as a
+  check that looked in the right place, it also fails any scoped route that
+  reads its KB from somewhere the resolver does not inspect. A new unscoped
+  route fails CI with instructions. Meta and admin surfaces (`/stats`,
+  `/plugins*`, `/settings*`, `/repos*`, `/worktree*`, the remaining git-ops
+  routes, MCP over HTTP) are allowlisted pending the same treatment; they
+  are tier-guarded today but not per-KB scoped.
+
+### Fixed
+
+- REST field projections now preserve `id` and `kb_name` (Berkay Byte).
+
 ### Added
 
+- **`pyrite --version` (also `-V`), which had never existed.** The CLI
+  answered `Error: No such option: --version` for every release up to this
+  one. The version itself was never wrong — `pyrite.__version__` reads from
+  `pyproject.toml` with an installed-metadata fallback, and a test has pinned
+  it since it drifted to `0.12.0` while `pyproject.toml` said `0.24.1`. That
+  test covered the package attribute; nothing covered the command line, which
+  is the surface a user meets first. Found by the release script's own
+  release-layer step on its first real run, against a clean install from the
+  release SHA.
+
+- **`scripts/release.py`: a release is one command.** Six ordered steps, with
+  every check in front of the first thing that cannot be undone —
+  preconditions (clean `dev` at `origin/dev`; `origin` really being the repo
+  the `gh` calls name; `vX.Y.Z` existing neither locally, on `origin`, nor as
+  a GitHub release, and `origin/main` already an ancestor of the SHA, so the
+  publish can only ever fast-forward; the version; a dated CHANGELOG section
+  with content; the `release-blocker` label existing, with no open PR carrying
+  it), the required CI checks green on that exact SHA (newest run per check
+  name, so a rerun to green counts; `--wait-ci` waits, 15 minutes by default),
+  the release layer verified *before* the tag exists (install from the SHA
+  into a throwaway venv, `pyrite --version`, the getting-started tutorial run
+  against that install, a Docker build when docker is present), then `main`,
+  the tag and the GitHub release, then reopening `[Unreleased]` on its own
+  branch for a PR to `dev`, then a handoff step naming what the release cannot
+  do. `--dry-run` is the default and prints every command, writing nothing to
+  disk; `--execute` is the only way anything is written. It never passes
+  `--no-verify`, never force-pushes, never deletes a ref and never creates a
+  label. A failure after the publish step began lists which commands already
+  ran rather than claiming nothing was attempted.
+  `scripts/run_tutorial.sh` gains `PYRITE_TUTORIAL_VENV` so the tutorial can
+  be run against an arbitrary install rather than the checkout's.
 - Repo-local configuration: a `.pyrite/config.yaml` in the current directory
   or any parent is used instead of `~/.pyrite` when no `PYRITE_CONFIG_DIR` /
   `PYRITE_DATA_DIR` is set, so a checkout (or a git worktree) can carry its own
@@ -133,8 +300,38 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
 
 ### Documentation
 
-- `docs/configuration.md`: `config.yaml` and every `PYRITE_*` environment
-  variable, in one place (there was none).
+- Six false statements in agent-facing docs, found by a cold read and
+  independently re-verified (#229): `CLAUDE.md` documented a `--title` flag
+  `pyrite sw new-adr` does not have (title is positional; same fix applied
+  to `.claude/skills/kb/SKILL.md` and `.claude/skills/software-kb/SKILL.md`,
+  which repeated it) — **@Umar-2026 found and fixed the same `--title` bug
+  independently in #237, fourteen minutes before this sweep merged**;
+  `docs/json-contracts.md`'s `has_more`/`total` claims
+  are replaced with a measured per-surface, per-transport table (`search`,
+  `list_entries`, `recent`, `tags`, `backlinks` × CLI/MCP/REST — none of
+  them uniform); the 29/11/8 MCP tool-tier counts in `docs/getting-started.md`,
+  `README.md` and `pyrite mcp --help` undercounted by 2.4x by omitting 41+
+  plugin tools exposed per tier — `pyrite mcp --help`'s counts are now
+  generated from the live tool registry (true counts: read 70, write 103,
+  admin 112) and the other two docs point to it instead of retyping a
+  number; `docs/gemini-mcp-integration.md` and `docs/openai-mcp-integration.md`
+  now name which binary (`pyrite mcp` vs `pyrite-server`) each tier default
+  applies to, since the two disagree (`write` vs `read`); `kb_bulk_create`'s
+  MCP tool description no longer claims best-effort per-entry semantics
+  (#95: one malformed entry rejects the whole batch); `AGENTS.md` now says
+  `pyrite orient`'s schema block has no field list for plugin-declared
+  types (#232) instead of implying it always does.
+- `kb/runbooks/setting-up-dev-environment.md` (#212): the troubleshooting
+  runbook had drifted from CONTRIBUTING and could not run the suite —
+  `pip install -e ".[dev]"` (no `fastapi`, no CLI deps, cannot collect
+  tests) is now `.[all]`; the extension install is a `for ext in
+  extensions/*/` loop instead of an enumerated list missing `cascade` and
+  `journalism-investigation` and naming a nonexistent `task` extension; the
+  hard-coded "1780+ tests" is replaced with the `--collect-only` command
+  itself, per the counts-drift backlog item.
+- CONTRIBUTING: the AI-assisted-contribution note now accepts a git
+  `Co-authored-by:` trailer as the declaration (machine-readable, survives
+  squash-merge) alongside the existing, still-welcome PR-body mention.
 - CONTRIBUTING rewritten for a project with contributors: branch flow and
   required checks (ADR-0032), the three hook stages, where bugs vs roadmap
   items live (ADR-0033), a one-week first-response intent, how to run the
@@ -150,6 +347,67 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
 
 ### Changed
 
+- **`auto_embed: true` now guarantees that an entry *will be* embedded, not
+  that it is embedded when the write returns (ADR-0035).** A write records the
+  entry, makes it keyword-searchable immediately, and notes one `pending` row
+  in `embed_queue`; it never imports torch and never touches the network.
+  The debt is paid on paths that already have a caller willing to wait —
+  `pyrite index embed` / `index sync` / `index build`, every `pyrite-server`
+  startup, and `POST /api/index/sync?wait=true` — and
+  `GET /api/index/embed-status` reports what is outstanding. **Semantic search
+  is therefore eventually-consistent:** an entry written a moment ago may not
+  be findable by meaning until a drain runs, and a semantic search against a
+  KB with no embeddings now says so in `warnings` (naming `pyrite index
+  embed`) instead of returning a silent empty list. No background thread is
+  introduced (deliberately not copying #102's unjoined daemon thread).
+  `auto_embed: false` is unchanged: nothing is enqueued and no embedding code
+  is reached at all.
+- **MCP reads are bounded by default, and the bound can no longer be
+  defeated (ADR-0034 rules 1, 3, 4).** Two behaviour changes for clients
+  passing large `body_limit`s: the per-body ceiling drops from **50,000 to
+  20,000** characters (92% of measured bodies still fit in one call; the
+  rest continue with `kb_read_body`), and multi-entry reads gain a
+  **per-response budget of 40,000 body characters** — previously the
+  ceiling was per body, so 50 entries at it was a megabyte. Bodies fill in
+  request order; an entry reached after the budget is spent comes back in
+  place with an empty body, `body_truncated: true` and its true
+  `body_length`, never dropped and never reported `not_found`.
+
+  All three numbers are now configuration read at server start —
+  `PYRITE_BODY_CHUNK_DEFAULT` (8000), `PYRITE_BODY_CHUNK_MAX` (20000),
+  `PYRITE_BODY_RESPONSE_BUDGET` (40000). An invalid value (non-integer,
+  ≤ 0, or a default above the max) stops the server with a message naming
+  the variable rather than silently falling back, and the MCP tool
+  descriptions report the effective values instead of compiled-in ones.
+
+- **A `fields` projection no longer skips body chunking** — the documented
+  contract it replaces is retired (ADR-0034 rule 1: a parameter that
+  reduces output never disables another bound). `kb_get` and
+  `kb_batch_read` with `fields=[..., "body"]` and `body_limit=6000`
+  returned 171,189 characters, 28× the explicit cap (#58); the same call
+  now returns 12,369. A projection that keeps `body` also keeps
+  `body_truncated`, `body_length`, `body_offset` and `body_chunk_size`, so
+  a truncated body can still be recognised as one.
+
+  The same hole was open on three read paths the issue did not name, and
+  they are closed with it: `kb_search` returned whole bodies for both
+  `include_body=true` and `fields=[..., "body"]` (it has no `body_limit`
+  at all, so it is bounded at the default chunk within the response
+  budget), and `kb_list_entries` and `kb_recent` returned whole bodies for
+  up to 200 entries whether or not `fields` was passed.
+
+- Three open process findings fixed: `.claude/THEME.md` is no longer tracked
+  (it was gitignored but the already-committed blob kept riding every branch,
+  risking add/add conflicts — #122); `scripts/verify-red.sh` now refuses
+  (exit 2) when a reverted production file's top-level package resolves
+  outside the worktree's interpreter, so a review worktree with a symlinked
+  `.venv` can no longer report a suite number measured against the wrong
+  checkout — #189; and the PR gate's `changes` classifier gained an `infra`
+  output that widens the `test` job's matrix to all three interpreters when a
+  PR touches test infrastructure (`conftest.py`, `pyproject.toml`,
+  `.pre-commit-config.yaml`, `ci.yml`, `scripts/*`), so a change whose
+  behaviour is a property of the interpreter — like #81's `@classmethod`
+  fixtures — can't merge green on 3.12 and redden `dev` on 3.13 — #133.
 - `web/` dependency bumps (supersedes Dependabot PRs #23-#29, one reviewable
   change): `@sveltejs/kit` 2.53.0→2.70.3 (security fixes — CSRF protection on
   non-production `NODE_ENV` builds, prototype pollution in file-input
@@ -235,8 +493,50 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   types, CLI commands, MCP tools and a preset, not supported products.
   Wording only — no package name, entry point, module path, preset name,
   template name, CLI command name, MCP tool name or directory changed.
+- CONTRIBUTING: how to claim an issue
 
 ### Fixed
+
+- **The first write on a fresh install no longer blocks for over a minute
+  downloading the embedding model (#13).** `KBService._auto_embed` took a
+  synchronous branch whenever `self._embedding_worker` was unset — and nothing
+  in production ever set it, so *every* write on *every* surface imported
+  torch and fetched ~90 MB inside the request. Writes now enqueue (see
+  ADR-0035 under Changed): measured on a live `pyrite-server` with an empty
+  `HF_HOME` and the network blocked, `POST /api/entries` returns in
+  milliseconds instead of failing a 2 s budget, and the entry is
+  keyword-searchable at once.
+
+- **Writing back a body that a bounded read had truncated silently destroyed
+  the rest of the entry.** `kb_get`/`kb_batch_read` return at most the default
+  chunk (8,000 characters, `PYRITE_BODY_CHUNK_DEFAULT`) of a long body plus
+  `body_truncated: true`; nothing refused that body on the way back in, so an
+  agent that edited what it received and saved it replaced a
+  170,000-character entry with that fragment — silent, permanent, and produced
+  by the safety feature itself. 21% of entries on the maintainer's index are
+  long enough to be affected. Every write surface that can receive a
+  body now refuses one carrying a truthy `body_truncated` marker, with
+  `VALIDATION_FAILED`, `retryable: false` and a message naming `kb_read_body` /
+  `body_offset` as the way to assemble the whole body first: MCP's write and
+  admin tiers (`kb_create`, `kb_update`, `task_create`, `task_decompose` and
+  any plugin write tool, guarded at the dispatcher), `kb_bulk_create`
+  per-item, REST `POST`/`PUT`/`PATCH /api/entries` plus
+  `POST /api/entries/import` per-record, and the CLI — `pyrite import`
+  per-record (exiting 1, so a script cannot read "Imported N" off a run that
+  dropped a truncated body), `pyrite create` and `pyrite update`. A write
+  without the marker, a write carrying `body_truncated: false`, and a
+  metadata-only update that carries the marker but no body are all unaffected.
+  ADR-0034 rule 2; the CLI half closes #230.
+
+  `pyrite create --body-file`/`--stdin` lifts a file's YAML frontmatter into
+  the entry's fields, so a bounded read saved to a scratch file — the most
+  likely way a marker gets persisted before being replayed — is refused too.
+  `pyrite update --body-file` does not parse frontmatter and is unchanged: a
+  marker there is body content, not a write argument.
+
+  Importer audit: `json` and `markdown` carry the marker through to the
+  caller, `yaml` and `csv` strip it through their key whitelists. Both import
+  endpoints check every record regardless of format.
 
 - **Extension entry classes silently dropped `aliases` and `_schema_version` on
   every load -> save round trip, and rewrote `importance` back to its default**
@@ -253,19 +553,13 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   `tests/test_frontmatter_round_trip_all_types.py` parametrizes over every
   registered entry type (core + every installed plugin) and pins the
   guarantee for future types automatically.
-- **A `GenericEntry` no longer duplicates its undeclared frontmatter keys into
-  a `metadata:` block on save.** `Entry._base_frontmatter` serialized the whole
-  `self.metadata` mapping as a nested block while `GenericEntry.to_frontmatter`
-  also promoted the same keys to top level, so a no-op load→save grew a
-  `metadata:` block the source file never had. Only keys that came from an
-  explicit `metadata:` block stay nested now; the rest are promoted once
-  (#149). A `metadata:` value that is not a mapping (null, a string, a list, a
-  number) is kept verbatim and written back on the next save, with a warning,
-  instead of failing the load and saving the file back as a different entry
-  type. Deliberate behaviour change: an entry *created* with `metadata={…}` now
-  writes those keys top-level only, where `dev` also wrote a nested block --
-  except a key the base frontmatter already emits (`title`, `id`, …), which
-  stays nested under `metadata:` rather than being dropped.
+- **The REST `POST /entries/batch` endpoint now matches the MCP
+  `kb_batch_read` contract.** A malformed spec returns a structured
+  `VALIDATION_FAILED` (HTTP 400) naming `entries[i]` instead of a 500, a
+  `fields` value that is not an array of strings gets the same
+  `VALIDATION_FAILED` instead of a near-empty 200, and the `fields` projection
+  always keeps `id` and `kb_name`, so `found` can no longer contradict
+  `not_found` (#134).
 - **`kb_batch_read` no longer crashes on a malformed spec, and every `fields`
   projection keeps the identity pair.** A non-list `entries`, a non-object item,
   or a missing, empty or non-string `entry_id`/`kb_name` used to raise a raw
@@ -300,6 +594,35 @@ Target: 0.24.2 "Operational" — see `kb/roadmap.md`.
   `strictPort: true` — a taken 5173 is a startup error instead of silently
   moving to 5174, which is the same silent-fallback problem this fix exists
   to close, just visible outside the e2e path too.
+- **Search filters were silently ignored in semantic and hybrid modes — and
+  hybrid is the default.** `entry_type`, `tags`, `state`, `fips` and `status`
+  were compiled only into the keyword leg's `WHERE`; the vector leg ran with
+  `kb_name` alone and the two were fused, so a filtered search returned
+  plausible-looking entries the filter excluded (`--type mechanism` returning
+  themes; a bogus type returning a full result set instead of zero). Every
+  filter is now applied on every leg in every mode: `SearchBackend.search_semantic`
+  takes the keyword leg's filter set, and all backends implement it — SQLite
+  escalates sqlite-vec's KNN budget so a selective filter costs no recall,
+  Postgres puts the predicates in the same `WHERE` as the distance ordering.
+  The backend conformance suite gained the semantic-filter cases. When a leg
+  cannot honour a filter it is dropped rather than returning unfiltered rows,
+  and the response carries a `warnings` array naming the filters responsible
+  (`GET /api/search` and MCP `kb_search`; on stderr for the CLI) — absent, never
+  null, when everything was applied, so a caller tests for the key. Whether a
+  backend can filter its vector leg is a declared capability
+  (`BackendCapability.FILTERED_SEMANTIC`), not a probe: an earlier draft
+  inferred it from a `TypeError`, which turned any genuine bug inside the
+  vector leg into a silently dropped one. The archived-entry exclusion counts
+  as a filter and now holds on the vector leg too. `limit` is validated at the
+  service boundary rather than failing as a `TypeError` or a SQLite error deep
+  inside a leg. Two notes for operators: SQLite's KNN escalation is capped at
+  sqlite-vec's hard ceiling of `k = 4096`, so on an index larger than that a
+  filter selective enough to exclude the 4096 nearest neighbours under-returns
+  on the vector leg (best-effort recall — the keyword leg has no such ceiling
+  and carries hybrid); and the `kb_names` permission allowlist remains a Python
+  post-filter (`SearchService._restrict`) rather than a backend predicate,
+  unchanged by this work and correct, since it over-fetches before restricting.
+  Fixes #56, #53.
 - **The New Entry page's Create button could submit before the target KB was
   known.** `kbStore.activeKB` resolves asynchronously on mount; nothing
   disabled Create while it was still empty, so a fast click sent `kb: ''` and

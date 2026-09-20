@@ -4,7 +4,7 @@ import io
 import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ...config import PyriteConfig
 from ...exceptions import (
@@ -48,6 +48,60 @@ from ..schemas import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Entries"])
+
+
+async def refuses_truncated_body(request: Request) -> None:
+    """ADR-0034 rule 2 for the REST JSON write endpoints.
+
+    A FastAPI dependency rather than a check inside each handler, because the
+    pydantic request models do not declare `body_truncated` and drop it before
+    any handler could see it. This reads the *raw* JSON body, so the marker is
+    still there. It runs before the handler and raises 400 instead of letting
+    a partial body overwrite a whole one.
+
+    A request whose payload is not JSON (a multipart upload, an empty body) is
+    left alone: there is nothing to inspect, and `/entries/import` does its own
+    per-item check on the parsed file.
+
+    **The JSON test mirrors FastAPI's own**, deliberately. FastAPI parses a
+    body whenever the media type's maintype is `application` and its subtype
+    is `json` or ends `+json`, lower-cased by `email.message` first
+    (`fastapi/routing.py::get_request_handler`). A narrower test here does not
+    make the guard conservative -- it makes it *bypassable*, because the
+    handler still runs and still writes. `Content-Type: Application/JSON` is
+    legal (media types are case-insensitive, RFC 9110 section 8.3) and
+    `application/vnd.api+json` is ordinary; both parsed and both skipped this
+    guard until the cold read caught it.
+    """
+    from ...services.body_bounds import REFUSAL_SUGGESTION, refuse_truncated_body
+
+    media_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if not (media_type == "application/json" or media_type.endswith("+json")):
+        return
+    try:
+        payload = await request.json()
+    except Exception:
+        return
+
+    # PATCH writes one named field, so it is a body write only when that field
+    # IS the body -- and then `value`, not a `body` key, holds the body.
+    if isinstance(payload, dict) and payload.get("field") is not None:
+        if payload.get("field") != "body":
+            return
+        payload = {**payload, "body": payload.get("value")}
+
+    message = refuse_truncated_body(payload)
+    if message is None:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "code": "VALIDATION_FAILED",
+            "message": message,
+            "hint": REFUSAL_SUGGESTION,
+            "retryable": False,
+        },
+    )
 
 
 @router.get(
@@ -342,6 +396,14 @@ def batch_read_entries(
     entries_spec = body.get("entries", [])
     fields_param = body.get("fields")
 
+    if not isinstance(entries_spec, list):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "VALIDATION_FAILED",
+                "message": "entries must be an array of {entry_id, kb_name} objects",
+            },
+        )
     if not entries_spec:
         raise HTTPException(
             status_code=400,
@@ -353,6 +415,42 @@ def batch_read_entries(
             detail={"code": "VALIDATION_FAILED", "message": "Maximum 50 entries per call"},
         )
 
+    # REST parity with the MCP kb_batch_read contract (#134): a malformed spec is
+    # a client error with a stable code, not a 500, and the identity pair is
+    # always kept so `found` cannot contradict `not_found` when `fields` omits it.
+    for index, spec in enumerate(entries_spec):
+        if (
+            not isinstance(spec, dict)
+            or not isinstance(spec.get("entry_id"), str)
+            or not spec["entry_id"]
+            or not isinstance(spec.get("kb_name"), str)
+            or not spec["kb_name"]
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "VALIDATION_FAILED",
+                    "message": (
+                        f"entries[{index}] must be an object with non-empty string "
+                        "entry_id and kb_name"
+                    ),
+                },
+            )
+
+    # `fields`, like `entries`, is caller-supplied: a wrong type must be the same
+    # structured 400, not a 500 from the star-unpack below (#134 review).
+    if fields_param is not None and (
+        not isinstance(fields_param, list)
+        or any(not isinstance(field, str) for field in fields_param)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "VALIDATION_FAILED",
+                "message": "fields must be an array of strings",
+            },
+        )
+
     ids = [(e["entry_id"], e["kb_name"]) for e in entries_spec]
     if readable is not None:
         # Items in KBs the caller may not read are reported as not found.
@@ -360,9 +458,11 @@ def batch_read_entries(
     results = svc.get_entries(ids)
 
     if fields_param:
-        results = [{k: r[k] for k in fields_param if k in r} for r in results]
+        # Keep the identity pair in the projection: found_ids below reads it,
+        # and dropping it is what made `found` and `not_found` disagree (#134).
+        results = [{k: r[k] for k in ("id", "kb_name", *fields_param) if k in r} for r in results]
 
-    found_ids = {(r.get("id"), r.get("kb_name")) for r in results}
+    found_ids = {(r["id"], r["kb_name"]) for r in results}
     requested = [(e["entry_id"], e["kb_name"]) for e in entries_spec]
     not_found = [
         {"entry_id": eid, "kb_name": kb} for eid, kb in requested if (eid, kb) not in found_ids
@@ -576,16 +676,28 @@ async def import_entries(
             detail={"code": "PARSE_ERROR", "message": f"Failed to parse file: {e}"},
         )
 
+    from ...services.body_bounds import MARKER_KEYS, refuse_truncated_body
+
     created = []
     errors = []
     for entry_data in parsed:
+        # ADR-0034 rule 2, per item: an imported record that carries the
+        # truncation marker alongside a body is a partial read someone saved
+        # to a file. Refuse it on its own; import the clean records.
+        refusal = refuse_truncated_body(entry_data)
+        if refusal is not None:
+            errors.append({"title": entry_data.get("title", "?"), "error": refusal})
+            continue
         try:
             entry_id = entry_data.get("id") or generate_entry_id(entry_data["title"])
             entry_type = entry_data.get("entry_type", "note")
+            # The truncation keys are transport, not content: an untruncated
+            # record may still carry `body_truncated: false`, and that must not
+            # become frontmatter on the stored entry.
             extra = {
                 k: v
                 for k, v in entry_data.items()
-                if k not in ("id", "title", "entry_type", "body") and v is not None
+                if k not in ("id", "title", "entry_type", "body", *MARKER_KEYS) and v is not None
             }
             entry = svc.create_entry(
                 kb, entry_id, entry_data["title"], entry_type, entry_data.get("body", ""), **extra
@@ -616,7 +728,14 @@ def get_entry(
     entry_id: str,
     kb: str | None = Query(None, description="KB name (optional)"),
     with_links: bool = Query(False, description="Include links"),
-    fields: str | None = Query(None, description="Comma-separated fields to return"),
+    fields: str | None = Query(
+        None,
+        description=(
+            "Comma-separated fields to return. "
+            "id and kb_name are always included; when fields is set the response is a "
+            "projection of the stored entry, not EntryResponse."
+        ),
+    ),
     svc: KBService = Depends(get_kb_service),
     resolver=Depends(get_worktree_resolver),
     readable: set[str] | None = Depends(get_readable_kbs),
@@ -659,11 +778,12 @@ def get_entry(
     # Apply field projection
     if fields:
         fields_list = [f.strip() for f in fields.split(",")]
-        result = {k: result[k] for k in fields_list if k in result}
+        projected_fields = dict.fromkeys(("id", "kb_name", *fields_list))
+        result = {k: result[k] for k in projected_fields if k in result}
         neg = negotiate_response(request, result)
         if neg is not None:
             return neg
-        return result
+        return JSONResponse(content=result)
 
     neg = negotiate_response(request, result)
     if neg is not None:
@@ -672,7 +792,9 @@ def get_entry(
 
 
 @router.post(
-    "/entries", response_model=CreateResponse, dependencies=[Depends(requires_kb_tier("write"))]
+    "/entries",
+    response_model=CreateResponse,
+    dependencies=[Depends(requires_kb_tier("write")), Depends(refuses_truncated_body)],
 )
 @limiter.limit("30/minute")
 def create_entry(
@@ -736,7 +858,7 @@ def create_entry(
 @router.put(
     "/entries/{entry_id}",
     response_model=UpdateResponse,
-    dependencies=[Depends(requires_kb_tier("write"))],
+    dependencies=[Depends(requires_kb_tier("write")), Depends(refuses_truncated_body)],
 )
 @limiter.limit("30/minute")
 def update_entry(
@@ -787,7 +909,7 @@ def update_entry(
 @router.patch(
     "/entries/{entry_id}",
     response_model=UpdateResponse,
-    dependencies=[Depends(requires_kb_tier("write"))],
+    dependencies=[Depends(requires_kb_tier("write")), Depends(refuses_truncated_body)],
 )
 @limiter.limit("30/minute")
 def patch_entry_field(

@@ -358,6 +358,14 @@ class EmbeddingService:
         kb_name: str | None = None,
         limit: int = 20,
         max_distance: float = 1.3,
+        entry_type: str | None = None,
+        tags: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        fips: str | None = None,
+        state: str | None = None,
+        status: str | None = None,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         """
         Search for semantically similar entries using vector KNN.
@@ -368,6 +376,13 @@ class EmbeddingService:
             limit: Max results to return.
             max_distance: Cosine distance cutoff (0=identical, 2=opposite).
                 Results with distance > max_distance are excluded.
+            entry_type, tags, date_from, date_to, fips, state, status,
+            include_archived: the same filter set the keyword leg takes.
+                Applied by the backend inside the KNN query rather than after
+                it (#56) — a filter honoured on only one leg makes a fused
+                hybrid result violate it. ``include_archived`` is the default
+                exclusion rather than a value filter, and holds on both legs
+                for the same reason.
 
         Returns list of entry dicts with 'distance' and 'snippet' fields.
         """
@@ -381,6 +396,14 @@ class EmbeddingService:
             kb_name=kb_name,
             limit=limit,
             max_distance=max_distance,
+            entry_type=entry_type,
+            tags=tags,
+            date_from=date_from,
+            date_to=date_to,
+            fips=fips,
+            state=state,
+            status=status,
+            include_archived=include_archived,
         )
 
         # Add relevance-aware snippets to results

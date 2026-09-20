@@ -17,6 +17,14 @@ from ..models import Link
 from .base_backend import BaseBackend
 from .capabilities import BackendCapability
 
+#: sqlite-vec's hard ceiling on ``k`` in a KNN query. Asking for more is not a
+#: slow query but an error — sqlite-vec 0.1.9 raises
+#: ``OperationalError: k value in knn query too large, provided N and the limit
+#: is 4096``. Every ``k`` the semantic leg builds is clamped against this, so a
+#: filtered search over an index larger than the cap under-returns rather than
+#: raising (#56).
+_SQLITE_VEC_MAX_K = 4096
+
 
 class SQLiteBackend(BaseBackend):
     """SearchBackend implementation for SQLite + FTS5 + sqlite-vec."""
@@ -25,10 +33,14 @@ class SQLiteBackend(BaseBackend):
     # FTS5 keyword search, and sqlite-vec embeddings. EMBEDDING is declared at
     # the class level ("can in principle"); whether sqlite-vec is loaded right
     # now is a separate runtime gate (``vec_available``). See capabilities.py.
+    # FILTERED_SEMANTIC: ``search_semantic`` compiles the same predicates as
+    # ``search`` into the KNN query, so a fused hybrid result can never contain
+    # an entry the caller's filter excluded (#56).
     capabilities: ClassVar[set[BackendCapability]] = {
         BackendCapability.ENTITY,
         BackendCapability.SEARCH,
         BackendCapability.EMBEDDING,
+        BackendCapability.FILTERED_SEMANTIC,
     }
 
     def __init__(
@@ -317,33 +329,182 @@ class SQLiteBackend(BaseBackend):
         kb_name: str | None = None,
         limit: int = 20,
         max_distance: float = 1.3,
+        entry_type: str | None = None,
+        tags: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        fips: str | None = None,
+        state: str | None = None,
+        status: str | None = None,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
+        """KNN over ``vec_entry``, filtered by the same predicates as ``search``.
+
+        sqlite-vec's ``MATCH`` needs a literal ``k`` (the number of nearest
+        neighbours to consider) and applies it *before* any join predicate, so
+        a filter cannot be pushed into the KNN itself. Filtering the k rows
+        afterwards would silently under-return whenever the k nearest happen
+        not to match the filter. Instead we over-fetch and escalate ``k`` until
+        ``limit`` rows survive the filter, ``k`` covers every embedded row, or
+        ``k`` reaches :data:`_SQLITE_VEC_MAX_K`.
+
+        **Recall is best-effort at the cap.** sqlite-vec refuses ``k`` above
+        4096 outright, so on an index larger than that a filter selective
+        enough to exclude the 4096 nearest neighbours returns fewer rows than
+        ``limit`` — possibly none. That is a deliberate under-return, never an
+        exception and never a row the filter excluded. The keyword leg, which
+        has no such ceiling, is unaffected; in hybrid mode it carries the
+        result.
+
+        The escalation costs one extra query per round, and only when the
+        previous budget did not fill ``limit``: an unfiltered search whose
+        nearest neighbours all survive ``max_distance`` runs exactly one query,
+        the same as before filters were threaded through.
+        """
         if not self.vec_available:
             return []
         blob = self._embedding_to_blob(embedding)
-        fetch_limit = limit * 3 if kb_name else limit * 2
-        rows = self._raw_conn.execute(
-            """
-            SELECT v.rowid, v.distance, e.*
-            FROM vec_entry v
-            JOIN entry e ON v.rowid = e.rowid
-            WHERE v.embedding MATCH ? AND k = ?
-            ORDER BY v.distance
-            """,
-            (blob, fetch_limit),
-        ).fetchall()
-        results = []
-        for row in rows:
-            entry = dict(row)
-            distance = entry.get("distance", 0)
-            if distance > max_distance:
-                continue
-            if kb_name and entry.get("kb_name") != kb_name:
-                continue
-            results.append(entry)
-            if len(results) >= limit:
+
+        where, params, selective = self._semantic_filter_sql(
+            kb_name=kb_name,
+            entry_type=entry_type,
+            tags=tags,
+            date_from=date_from,
+            date_to=date_to,
+            fips=fips,
+            state=state,
+            status=status,
+            include_archived=include_archived,
+        )
+
+        # The KNN k-set is materialised in a CTE and its size carried on every
+        # row *and* on a filter-independent probe row, so exhaustion is visible
+        # even when the filter removes every neighbour: fewer neighbours back
+        # than k asked for means the table is exhausted and escalating again
+        # would be wasted. That is the exhaustion signal — an unconditional
+        # ``COUNT(*) FROM vec_entry`` would instead scan the whole vector table
+        # on every semantic search, filtered or not.
+        sql = f"""
+            WITH knn AS (
+                SELECT rowid, distance
+                FROM vec_entry
+                WHERE embedding MATCH ? AND k = ?
+            ), knn_size AS (
+                SELECT COUNT(*) AS n FROM knn
+            )
+            SELECT knn.rowid, knn.distance, e.*, knn_size.n AS _knn_size
+            FROM knn
+            JOIN entry e ON knn.rowid = e.rowid
+            CROSS JOIN knn_size
+            WHERE 1=1{where}
+            ORDER BY knn.distance
+        """
+        size_sql = """
+            WITH knn AS (
+                SELECT rowid FROM vec_entry WHERE embedding MATCH ? AND k = ?
+            )
+            SELECT COUNT(*) FROM knn
+        """
+        # Over-fetch more when a caller-supplied filter may cull the k nearest.
+        # The archived exclusion is not counted: it applies to every search, so
+        # treating it as a filter would triple the budget of every query.
+        k = min(limit * 3 if selective else limit * 2, _SQLITE_VEC_MAX_K)
+        results: list[dict[str, Any]] = []
+        while True:
+            rows = self._raw_conn.execute(sql, [blob, k, *params]).fetchall()
+            results = []
+            for row in rows:
+                entry = dict(row)
+                entry.pop("_knn_size", None)
+                if entry.get("distance", 0) > max_distance:
+                    continue
+                results.append(entry)
+                if len(results) >= limit:
+                    break
+            if len(results) >= limit or k >= _SQLITE_VEC_MAX_K:
+                # Filled, or at sqlite-vec's hard ceiling — recall is
+                # best-effort from here.
                 break
+            # Did the KNN itself run out of neighbours, or did the filter eat
+            # them? Rows carry the k-set's size; only when the filter removed
+            # every row must we ask separately.
+            knn_size = (
+                rows[0]["_knn_size"]
+                if rows
+                else (self._raw_conn.execute(size_sql, (blob, k)).fetchone()[0])
+            )
+            if knn_size < k:
+                # The table is exhausted: a larger k cannot find more.
+                break
+            k = min(k * 4, _SQLITE_VEC_MAX_K)
         return results
+
+    @staticmethod
+    def _semantic_filter_sql(
+        kb_name: str | None = None,
+        entry_type: str | None = None,
+        tags: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        fips: str | None = None,
+        state: str | None = None,
+        status: str | None = None,
+        include_archived: bool = False,
+    ) -> tuple[str, list[Any], bool]:
+        """Build the WHERE fragment shared by the semantic leg and ``search``.
+
+        Deliberately mirrors the predicates in :meth:`search` one for one — the
+        two legs are fused, so any divergence is a filter the caller asked for
+        and did not get.
+
+        Returns ``(sql, params, selective)``. ``selective`` says whether any
+        *caller-supplied* filter is present; the archived exclusion does not
+        count, because it is the default on both legs and sizing every KNN
+        budget as if it were a filter would triple the work of an ordinary
+        search.
+        """
+        sql = ""
+        params: list[Any] = []
+        if not include_archived:
+            # Same default exclusion the keyword leg applies (#56): an archived
+            # entry must not enter a fused result via the vector side.
+            sql += " AND COALESCE(e.lifecycle, 'active') != 'archived'"
+        if kb_name:
+            sql += " AND e.kb_name = ?"
+            params.append(kb_name)
+        if entry_type:
+            sql += " AND e.entry_type = ?"
+            params.append(entry_type)
+        if date_from:
+            sql += " AND e.date >= ?"
+            params.append(date_from)
+        if date_to:
+            sql += " AND e.date <= ?"
+            params.append(date_to)
+        if tags:
+            placeholders = ",".join(["?"] * len(tags))
+            sql += f"""
+                AND e.id IN (
+                    SELECT et.entry_id FROM entry_tag et
+                    JOIN tag t ON et.tag_id = t.id
+                    WHERE t.name IN ({placeholders})
+                    GROUP BY et.entry_id, et.kb_name
+                    HAVING COUNT(DISTINCT t.name) = ?
+                )
+            """
+            params.extend(tags)
+            params.append(len(tags))
+        if fips:
+            sql += " AND e.fips = ?"
+            params.append(fips)
+        if state:
+            sql += " AND e.state = ?"
+            params.append(state)
+        if status:
+            sql += " AND e.status = ?"
+            params.append(status)
+        selective = any((kb_name, entry_type, date_from, date_to, tags, fips, state, status))
+        return sql, params, selective
 
     def has_embeddings(self) -> bool:
         if not self.vec_available:

@@ -21,7 +21,7 @@ This project has a comprehensive knowledge base in `kb/` indexed by Pyrite's own
 # Browse project structure
 .venv/bin/pyrite sw components    # Core modules and services
 .venv/bin/pyrite sw adrs          # Architecture Decision Records
-.venv/bin/pyrite sw backlog       # All backlog items with status
+.venv/bin/pyrite sw backlog       # Top 50 backlog items with status (--limit/--offset to page, --limit 0 for all)
 .venv/bin/pyrite sw standards     # Coding standards and conventions
 
 # Find what links to something
@@ -52,7 +52,7 @@ When your work changes architecture, adds components, or completes backlog items
 .venv/bin/pyrite create -k pyrite -t backlog_item --title "..." -b "..." --tags enhancement
 
 # Create new ADRs
-.venv/bin/pyrite sw new-adr --title "..." --status accepted
+.venv/bin/pyrite sw new-adr "..." --status accepted
 
 # Verify your changes are findable
 .venv/bin/pyrite search "<your feature>" -k pyrite
@@ -100,12 +100,12 @@ gh pr update-branch --rebase            #   rebase onto dev; checks re-run; auto
 Auto-merge does not rebase for you: with "up to date" required, a PR goes
 `BEHIND` the moment another one merges, and sits there until updated.
 
-CI on a PR: ~30 s for docs/KB-only changes, ~3 min for code (one interpreter; the full matrix runs on `dev` after the merge). If `dev` is red, no PR merges until it is fixed — that is the point. `rebase` is the default merge method; `squash` for a branch whose history is noise.
+CI on a PR runs the checks relevant to the changed files (one interpreter); the full matrix runs on `dev` after the merge. Runtime depends on the checks and runner availability. If `dev` is red, no PR merges until it is fixed — that is the point. `rebase` is the default merge method; `squash` for a branch whose history is noise.
 
 ## Testing
 
 ```bash
-# Backend tests (~3100 in tests/, ~4000 including extensions/*/tests/)
+# Backend tests
 .venv/bin/pytest tests/ -v
 
 # Frontend
@@ -146,7 +146,7 @@ One-time setup on a fresh clone: `.venv/bin/pip install -e ".[dev]"` (installs `
 |-------|-----------|
 | commit | ruff, ruff-format, trailing-whitespace, end-of-file, check-yaml, check-large-files, check-merge-conflict, debug-statements, import-cycle check, KB schema validation. Seconds. **No pytest.** |
 | commit-msg | `fix:` commits must touch `tests/` |
-| pre-push | full pytest suite incl. `extensions/`, `-n auto` (~3 min), only when the pushed range touches code or config |
+| pre-push | full pytest suite incl. `extensions/`, `-n auto`, only when the pushed range touches code or config; runtime varies by machine and load |
 | CI | the authority — everything above plus the full matrix |
 
 If ruff-format modifies files, re-stage and commit again.

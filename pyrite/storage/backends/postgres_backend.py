@@ -82,10 +82,15 @@ class PostgresBackend(BaseBackend):
     # tsvector keyword search, and pgvector embeddings. Declared at the class
     # level; runtime availability of the extensions is a separate gate. See
     # capabilities.py.
+    # FILTERED_SEMANTIC: ``search_semantic`` puts the same predicates as
+    # ``search`` in the same ``WHERE`` as the distance ordering, so a fused
+    # hybrid result can never contain an entry the caller's filter excluded
+    # (#56).
     capabilities: ClassVar[set[BackendCapability]] = {
         BackendCapability.ENTITY,
         BackendCapability.SEARCH,
         BackendCapability.EMBEDDING,
+        BackendCapability.FILTERED_SEMANTIC,
     }
 
     def __init__(self, session: Session, engine=None):
@@ -323,7 +328,25 @@ class PostgresBackend(BaseBackend):
         kb_name: str | None = None,
         limit: int = 20,
         max_distance: float = 1.3,
+        entry_type: str | None = None,
+        tags: list[str] | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        fips: str | None = None,
+        state: str | None = None,
+        status: str | None = None,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
+        """KNN over pgvector, honouring the same filters as ``search`` (#56).
+
+        Unlike sqlite-vec there is no separate KNN budget to escalate: every
+        predicate, ``max_distance`` included, goes into the same ``WHERE`` as
+        the distance ordering, so ``LIMIT`` applies after filtering and cannot
+        under-return. The predicates below mirror
+        :meth:`SQLiteBackend._semantic_filter_sql` one for one — the two
+        backends must return the same rows for the same call — and every value
+        is bound, never interpolated.
+        """
         vec_str = "[" + ",".join(str(v) for v in embedding) + "]"
         sql = """
             SELECT e.*, (e.embedding <=> CAST(:vec AS vector)) as distance
@@ -331,15 +354,60 @@ class PostgresBackend(BaseBackend):
             WHERE e.embedding IS NOT NULL
         """
         params: dict[str, Any] = {"vec": vec_str}
+        if not include_archived:
+            # Character for character the predicate ``search`` uses on this
+            # backend (see the keyword leg above): an archived entry must not
+            # enter a fused result via the vector side (#56).
+            sql += " AND COALESCE(e.lifecycle, 'active') != 'archived'"
         if kb_name:
             sql += " AND e.kb_name = :kb_name"
             params["kb_name"] = kb_name
+        if entry_type:
+            sql += " AND e.entry_type = :entry_type"
+            params["entry_type"] = entry_type
+        if date_from:
+            sql += " AND e.date >= :date_from"
+            params["date_from"] = date_from
+        if date_to:
+            sql += " AND e.date <= :date_to"
+            params["date_to"] = date_to
+        if tags:
+            tag_keys = []
+            for i, tag in enumerate(tags):
+                key = f"sem_tag_{i}"
+                tag_keys.append(f":{key}")
+                params[key] = tag
+            sql += f"""
+                AND e.id IN (
+                    SELECT et.entry_id FROM entry_tag et
+                    JOIN tag t ON et.tag_id = t.id
+                    WHERE t.name IN ({",".join(tag_keys)})
+                    GROUP BY et.entry_id, et.kb_name
+                    HAVING COUNT(DISTINCT t.name) = :sem_tag_count
+                )
+            """
+            params["sem_tag_count"] = len(tags)
+        if fips:
+            sql += " AND e.fips = :fips"
+            params["fips"] = fips
+        if state:
+            sql += " AND e.state = :state"
+            params["state"] = state
+        if status:
+            sql += " AND e.status = :status"
+            params["status"] = status
+        # ``max_distance`` belongs in the WHERE, not in a Python filter after
+        # the fact: applied post-LIMIT it culls rows the LIMIT already paid for
+        # and under-returns, where sqlite escalates its k instead. One
+        # predicate here keeps the two backends returning the same rows (#56).
+        sql += " AND (e.embedding <=> CAST(:vec3 AS vector)) <= :max_distance"
+        params["vec3"] = vec_str
+        params["max_distance"] = max_distance
         sql += " ORDER BY e.embedding <=> CAST(:vec2 AS vector) LIMIT :limit"
         params["vec2"] = vec_str
         params["limit"] = limit
 
-        rows = self._exec(sql, params)
-        return [r for r in rows if r.get("distance", 0) <= max_distance]
+        return self._exec(sql, params)
 
     def has_embeddings(self) -> bool:
         count = self._exec_scalar("SELECT COUNT(*) FROM entry WHERE embedding IS NOT NULL")

@@ -3,6 +3,7 @@
 import sqlite3
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 
 from ...services.kb_service import KBService
 from ...services.search_service import SearchService
@@ -19,7 +20,19 @@ from ..schemas import SearchResponse, SearchResult
 router = APIRouter(tags=["Search"])
 
 
-@router.get("/search", response_model=SearchResponse, dependencies=[Depends(requires_kb_read())])
+# ``response_model_exclude_none``: the happy path must not serialise
+# ``"warnings": null``. One convention across every surface — MCP omits the key,
+# the CLI prints nothing, REST omits it — so a caller can test ``"warnings" in
+# response`` and get the right answer. See ``SearchService.search``'s docstring
+# for what a search response owes its caller (#56). The web client already
+# declares the nullable result fields optional (web/src/lib/api/types.ts), so
+# omitting them rather than nulling them matches the contract it was written to.
+@router.get(
+    "/search",
+    response_model=SearchResponse,
+    response_model_exclude_none=True,
+    dependencies=[Depends(requires_kb_read())],
+)
 @limiter.limit("100/minute")
 def search(
     request: Request,
@@ -35,7 +48,14 @@ def search(
     include_body: bool = Query(
         False, description="Include full body text in results (default: snippet only)"
     ),
-    fields: str | None = Query(None, description="Comma-separated fields to return per result"),
+    fields: str | None = Query(
+        None,
+        description=(
+            "Comma-separated fields to return per result. "
+            "id and kb_name are always included; when fields is set the response is a "
+            "projection of the stored entry, not EntryResponse."
+        ),
+    ),
     group_by_kb: bool = Query(
         False, description="Return top results per KB instead of global ranking"
     ),
@@ -58,6 +78,10 @@ def search(
         )
 
     tag_list = tags.split(",") if tags else None
+    # Anything the search could not do as asked (today: a filter a backend's
+    # vector leg cannot honour). Omitted from the response when empty -- see the
+    # route decorator above and SearchService.search's docstring (#56).
+    warnings: list[str] = []
 
     try:
         # When grouping by KB, fetch more results to ensure coverage across KBs
@@ -74,6 +98,7 @@ def search(
             limit=fetch_limit,
             mode=mode,
             expand=expand,
+            warnings=warnings,
         )
 
         # Group by KB: take top N per KB, interleave by best score
@@ -106,17 +131,25 @@ def search(
         # Apply field projection or strip body
         if fields:
             fields_list = [f.strip() for f in fields.split(",")]
-            results = [{k: r[k] for k in fields_list if k in r} for r in results]
+            projected_fields = dict.fromkeys(("id", "kb_name", *fields_list))
+            results = [{k: r[k] for k in projected_fields if k in r} for r in results]
         elif not include_body:
             for r in results:
                 r.pop("body", None)
 
         resp_data = {"query": q, "count": len(results), "results": results}
+        if warnings:
+            resp_data["warnings"] = warnings
         neg = negotiate_response(request, resp_data)
         if neg is not None:
             return neg
+        if fields:
+            return JSONResponse(content=resp_data)
         return SearchResponse(
-            query=q, count=len(results), results=[SearchResult(**r) for r in results]
+            query=q,
+            count=len(results),
+            results=[SearchResult(**r) for r in results],
+            warnings=warnings or None,
         )
     except (sqlite3.OperationalError, ValueError) as e:
         raise HTTPException(status_code=400, detail={"code": "SEARCH_FAILED", "message": str(e)})
