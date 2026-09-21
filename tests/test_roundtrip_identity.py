@@ -2,10 +2,13 @@
 
 Loading every entry in a KB and saving it back with no edit should change
 nothing on disk. Before PR #69 this rewrote 768 of 768 real `kb/` files;
-#69 brought that down, and this test measured the remainder directly: 69 of
-770 files as of this branch, split across four distinct causes (see
+#69 brought that down, and this test measured the remainder directly: 58 of
+770 files as of this branch, split across three distinct causes (see
 `KNOWN_RESIDUAL_IDS` below -- each group is a separate, precisely-identified
-finding, not one blob).
+finding, not one blob). The block-indented `links:` group (11 ids, issue #148)
+is gone: `pyrite/utils/yaml.py` now reads a source document's own sequence
+indentation out of the parsed tree's line/column records and hands the emitter
+those numbers, so a no-op save leaves those files byte-identical.
 
 Every write-path bug in the run-up to this test -- #46 (an incidental
 `--tags` update rewriting the whole file), #86 (`pyrite create` leaking
@@ -119,28 +122,6 @@ LINKS_BARE_STRING_IDS: frozenset[str] = frozenset(
     }
 )
 
-# 2. BLOCK-INDENTED `links:` SEQUENCES (found by this gate, not previously
-#    known; filed as issue #148). Source has `links:` items indented 2
-#    spaces under the key (`sequence=4, offset=2` YAML style); the shared
-#    `YAML()` in pyrite/utils/yaml.py never calls `y.indent(...)`, so ruamel
-#    dumps with its default `sequence=2, offset=0` and the whole block comes
-#    back flush-left. Content is identical; only indentation moves.
-LINKS_BLOCK_INDENT_IDS: frozenset[str] = frozenset(
-    {
-        "adr-0017",
-        "adr-0018",
-        "adr-0018-web-ui-kb-management-backlog",
-        "adr-0019",
-        "adr-0020",
-        "adr-0021",
-        "adr-0027",
-        "component-path-validation",
-        "entry-protocol-mixins",
-        "rubric-checkers",
-        "task-phases-3-4-plan",
-    }
-)
-
 # 3. FIXED (issue #149): `GenericEntry` (pyrite/models/generic.py, backs
 #    `type: design`/`note`/any kb.yaml custom type) promoted undeclared
 #    frontmatter keys to `self.metadata`, while `Entry._base_frontmatter()`
@@ -197,7 +178,6 @@ TRAILING_BLANK_LINE_NORMALIZE_IDS: frozenset[str] = frozenset(
 # same commit as whatever fixed it).
 KNOWN_RESIDUAL_IDS: frozenset[str] = (
     LINKS_BARE_STRING_IDS
-    | LINKS_BLOCK_INDENT_IDS
     | GENERIC_METADATA_DUP_IDS
     | PREEXISTING_BODY_FOLD_IDS
     | TRAILING_BLANK_LINE_NORMALIZE_IDS
@@ -354,21 +334,20 @@ class TestRealKBRoundTrip:
             "and a GitHub issue"
         )
 
-    def test_known_residual_count_is_69(self):
+    def test_known_residual_count_is_58(self):
         """The count, recorded here per #146 acceptance criterion 4 ("the
 
         count in the test's docstring and in the report") as well as in the
-        module docstring: 69 ids as of this branch -- 46 bare-string links +
-        11 block-indented links + 6 pre-existing body: fold + 6
-        trailing-blank-line normalization. The `GenericEntry` metadata
-        duplication group is empty (fixed in #149).
+        module docstring: 58 ids as of this branch -- 46 bare-string links +
+        6 pre-existing body: fold + 6 trailing-blank-line normalization.
+        Two groups are empty: the `GenericEntry` metadata duplication group
+        (fixed in #149) and the block-indented `links:` group (fixed in #148).
         """
         assert len(LINKS_BARE_STRING_IDS) == 46
-        assert len(LINKS_BLOCK_INDENT_IDS) == 11
         assert len(GENERIC_METADATA_DUP_IDS) == 0
         assert len(PREEXISTING_BODY_FOLD_IDS) == 6
         assert len(TRAILING_BLANK_LINE_NORMALIZE_IDS) == 6
-        assert len(KNOWN_RESIDUAL_IDS) == 69
+        assert len(KNOWN_RESIDUAL_IDS) == 58
 
     # #146 acceptance criterion 4: "xfail(strict=True) on exactly the failing
     # ids with the count in the test's docstring and in the report, so the
