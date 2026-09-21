@@ -196,11 +196,6 @@ OPTIONAL_KB_TOOLS: dict[str, str] = {
                 "solidarity_infrastructure_types",
                 "solidarity_timeline",
             ),
-            "extensions/encyclopedia": (
-                "wiki_quality_stats",
-                "wiki_review_queue",
-                "wiki_stubs",
-            ),
         }.items()
         for name in names
     },
