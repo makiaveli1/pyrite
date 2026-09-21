@@ -7,7 +7,6 @@ Each KB is a directory of markdown files with YAML frontmatter.
 
 import logging
 from collections.abc import Iterator
-from datetime import UTC, datetime
 from pathlib import Path
 
 from ..config import KBConfig
@@ -331,13 +330,19 @@ class KBRepository:
             logger.warning("Could not load %s: %s", file_path, e)
             return None
 
-    def save(self, entry: Entry, subdir: str | None = None) -> Path:
+    def save(
+        self, entry: Entry, subdir: str | None = None, *, touch_updated_at: bool = True
+    ) -> Path:
         """
         Save an entry to file.
 
         Args:
             entry: The entry to save
             subdir: Optional subdirectory (auto-inferred if not provided)
+            touch_updated_at: Refresh ``updated_at`` as bookkeeping before
+                writing. Callers that already stamped it -- or that write a
+                caller-supplied ``updated_at`` and must not overwrite it
+                (#151) -- pass ``False``.
 
         Returns:
             Path to the saved file
@@ -358,7 +363,8 @@ class KBRepository:
             if type_schema and type_schema.version > 0:
                 entry._schema_version = type_schema.version
 
-        entry.updated_at = datetime.now(UTC)
+        if touch_updated_at:
+            entry.touch_updated_at()
         entry.save(file_path)
         entry.kb_name = self.name
         entry.file_path = file_path

@@ -23,6 +23,7 @@ from ..exceptions import (
     ValidationError,
 )
 from ..models import Entry
+from ..models.base import parse_datetime
 from ..models.factory import build_entry
 from ..plugins.context import PluginContext
 from ..storage.database import PyriteDB
@@ -653,6 +654,18 @@ class KBService:
         # Capture old_status before applying updates (for workflow hooks)
         old_status = getattr(entry, "status", None)
 
+        # A timestamp may arrive as a string: REST `PATCH /entries/{id}` sends
+        # `value: str` and the CLI passes `--field updated_at=…`. Coerce it
+        # before it is assigned -- the file, the model and the index all expect
+        # a `datetime`, and a string used to reach
+        # `IndexManager._entry_to_dict` (`entry.<ts>.isoformat()`) *after* the
+        # file had been written: an `AttributeError` that left the file written
+        # and the index stale, so the two diverged (#173 review). A naive
+        # string is read as UTC by `parse_datetime`, like ingestion.
+        for ts_key in ("created_at", "updated_at"):
+            if ts_key in updates and not isinstance(updates[ts_key], datetime):
+                updates[ts_key] = parse_datetime(updates[ts_key])
+
         # Apply updates
         for key, value in updates.items():
             if not hasattr(entry, key):
@@ -666,7 +679,12 @@ class KBService:
             else:
                 setattr(entry, key, value)
 
-        entry.updated_at = datetime.now(UTC)
+        # An explicit `updated_at` in the update is the caller's value; only
+        # stamp the bookkeeping time when they did not supply one, and tell the
+        # repository below not to stamp over a supplied one either (#151).
+        explicit_updated_at = "updated_at" in updates
+        if not explicit_updated_at:
+            entry.touch_updated_at()
 
         # Refuse before anything is written: the file must stay exactly as it was.
         self._validate_write(entry, kb_name, kb_config)
@@ -685,7 +703,9 @@ class KBService:
         entry = self._run_hooks("before_save", entry, hook_ctx)
 
         # Save to file, register KB, and re-index
-        self._doc_mgr.save_entry(entry, kb_name, kb_config)
+        self._doc_mgr.save_entry(
+            entry, kb_name, kb_config, touch_updated_at=not explicit_updated_at
+        )
 
         # Auto-embed for semantic search
         self._auto_embed(entry.id, kb_name)
@@ -887,7 +907,7 @@ class KBService:
             raise EntryNotFoundError(f"Entry not found: {target_id}")
 
         entry.add_link(target=target_id, relation=relation, note=note, kb=tkb)
-        entry.updated_at = datetime.now(UTC)
+        entry.touch_updated_at()
         self._doc_mgr.save_entry(entry, source_kb, kb_config)
         return {"resolved": resolved}
 
