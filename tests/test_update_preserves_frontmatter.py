@@ -14,6 +14,10 @@ frontmatter grows a `body:` key is silently wrong everywhere that reads
 frontmatter, and the file doubles in size on every update.
 """
 
+import re
+from datetime import UTC, datetime
+from pathlib import Path
+
 import pytest
 
 from pyrite.config import KBConfig, PyriteConfig, Settings
@@ -705,3 +709,363 @@ class TestLoadDoesNotCaptureInternalsAsExtras:
         meta = entry.to_frontmatter()
         for key in NEVER_IN_FRONTMATTER:
             assert key not in meta
+
+
+KB_NO_TIMESTAMPS = """---
+id: no-ts
+type: note
+title: No timestamps
+---
+
+Body.
+"""
+
+KB_WITH_TIMESTAMPS = """---
+id: with-ts
+type: note
+title: Has timestamps
+created_at: 2020-01-01T00:00:00+00:00
+updated_at: 2020-01-02T00:00:00+00:00
+---
+
+Body.
+"""
+
+KB_ONLY_CREATED_AT = """---
+id: created-only
+type: note
+title: Only one timestamp
+created_at: 2020-01-01T00:00:00+00:00
+---
+
+Body.
+"""
+
+KB_NUMERIC_TITLE = """---
+id: numeric-title
+type: note
+title: "2026-01-15"
+---
+
+Body.
+"""
+
+
+class TestRepositorySaveDoesNotInventTimestamps:
+    """#151, repository path: ``KBRepository.save()`` stamps ``updated_at`` on
+    every write (and ``KBService.update_entry`` / ``sw link`` do the same).
+
+    That stamp is internal bookkeeping, not a user editing the field, so it
+    must not turn a file that never carried the key into one that does -- the
+    #46 corruption arriving through the repository instead of KBService. A
+    file that *does* carry the key keeps it (and its original style).
+
+    ``KBRepository.save()`` infers a subdirectory from the entry and returns
+    the path it actually wrote, so every assertion here runs against that
+    path. The first version of these tests asserted on the source file, which
+    ``save()`` had not touched -- they passed with the fix reverted.
+    """
+
+    def _repo(self, tmp_path, name="repo151"):
+        from pyrite.storage.repository import KBRepository
+
+        kb_path = tmp_path / name
+        kb_path.mkdir(parents=True, exist_ok=True)
+        return KBRepository(KBConfig(name=name, path=kb_path)), kb_path
+
+    def test_a_file_without_timestamps_does_not_gain_them_on_save(self, tmp_path):
+        repo, kb_path = self._repo(tmp_path)
+        path = kb_path / "no-ts.md"
+        path.write_text(KB_NO_TIMESTAMPS, encoding="utf-8")
+        before = path.read_text(encoding="utf-8")
+
+        entry = repo.load_entry_from_file(path)
+        assert entry.updated_at is not None  # stamped in memory regardless
+        out = repo.save(entry)
+
+        after = out.read_text(encoding="utf-8")
+        assert after == before, "the repository save rewrote a file it had no reason to change"
+        assert set(_read_frontmatter(out)) == {"id", "type", "title"}, (
+            f"the repository save invented {sorted(set(_read_frontmatter(out)) - {'id', 'type', 'title'})}"
+        )
+
+    def test_a_file_with_timestamps_is_still_written_back(self, tmp_path):
+        repo, kb_path = self._repo(tmp_path, "repo151b")
+        path = kb_path / "with-ts.md"
+        path.write_text(KB_WITH_TIMESTAMPS, encoding="utf-8")
+
+        entry = repo.load_entry_from_file(path)
+        out = repo.save(entry)
+
+        after = _read_frontmatter(out)
+        assert "updated_at" in after, "a key the file carried was dropped"
+        assert after["created_at"] == datetime(2020, 1, 1, tzinfo=UTC), (
+            "KeyError on dev: the created_at the file carried was dropped"
+        )
+
+    def test_a_file_with_only_created_at_does_not_grow_updated_at(self, tmp_path):
+        repo, kb_path = self._repo(tmp_path, "repo151c")
+        path = kb_path / "created-only.md"
+        path.write_text(KB_ONLY_CREATED_AT, encoding="utf-8")
+
+        entry = repo.load_entry_from_file(path)
+        out = repo.save(entry)
+
+        after = _read_frontmatter(out)
+        assert after["created_at"] == datetime(2020, 1, 1, tzinfo=UTC)
+        assert "updated_at" not in after, "a half-stamped file grew the key it never had"
+
+
+def test_no_module_assigns_entry_updated_at_directly():
+    """`Entry.touch_updated_at()` is the only stamping path.
+
+    A plain `entry.updated_at = …` counts as an explicit user edit for
+    `__setattr__`, clears the key from `_absent_default_keys`, and makes the
+    write path grow `updated_at` on a file that never had it -- exactly the
+    regression #151's fix closes. Model-layer assignments read as
+    `entry.`/`self.`/`e.`, which is what this scans for; the storage layer
+    assigns ORM rows (`existing.updated_at = …`), a different object, and is
+    out of scope.
+    """
+    import pyrite as _pyrite
+
+    root = Path(_pyrite.__file__).resolve().parent
+    pattern = re.compile(r"\b(?:entry|self|e)\.updated_at\s*=[^=]")
+    offenders = [
+        f"{path.relative_to(root)}:{lineno}: {line.strip()}"
+        for path in sorted(root.rglob("*.py"))
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1)
+        if pattern.search(line)
+    ]
+    assert not offenders, (
+        "assign updated_at through Entry.touch_updated_at(), not directly (see #151): "
+        + "; ".join(offenders)
+    )
+
+
+def test_a_timestamp_looking_title_edit_reaches_the_file(tmp_path):
+    """#173 review: the same-instant comparison must only run for timestamps.
+
+    Applied to every key it kept the old node when a title was edited from
+    `"2026-01-15"` to `"2026-01-15T00:00:00Z"` -- the CLI reported success and
+    the file never changed, so the next index sync silently reverted the edit.
+    """
+    from pyrite.storage.repository import KBRepository
+
+    kb_path = tmp_path / "repo151d"
+    kb_path.mkdir(parents=True)
+    path = kb_path / "numeric-title.md"
+    path.write_text(KB_NUMERIC_TITLE, encoding="utf-8")
+    repo = KBRepository(KBConfig(name="repo151d", path=kb_path))
+
+    entry = repo.load_entry_from_file(path)
+    entry.title = "2026-01-15T00:00:00Z"
+    out = repo.save(entry)
+
+    assert "2026-01-15T00:00:00Z" in out.read_text(encoding="utf-8"), (
+        "the title edit was swallowed -- the write path kept the old node"
+    )
+
+
+def test_an_explicit_updated_at_update_keeps_the_callers_value(swkb_env):
+    """#173 review: `update_entry` must not stamp over a caller-supplied
+    `updated_at` -- before the guard it printed "Updated:" and wrote "now".
+
+    The third review's case: REST PATCH and the CLI's `--field` hand the value
+    in as a *string*. Assigned as-is it was written to the file as a quoted
+    string and then raised inside `IndexManager._entry_to_dict` (a `str` has no
+    `.isoformat`), so the file was written and the index was not.
+    """
+    path = swkb_env["note_file"]
+    explicit = datetime(2001, 2, 3, 4, 5, 6, tzinfo=UTC)
+
+    swkb_env["service"].update_entry("sample-note", "swkb", updated_at=explicit)
+
+    after = _read_frontmatter(path)
+    assert after["updated_at"] == explicit
+
+    entry = swkb_env["service"].update_entry(
+        "sample-note", "swkb", updated_at="2002-03-04T05:06:07+00:00"
+    )
+
+    assert entry.updated_at == datetime(2002, 3, 4, 5, 6, 7, tzinfo=UTC)
+    assert _read_frontmatter(path)["updated_at"] == datetime(2002, 3, 4, 5, 6, 7, tzinfo=UTC)
+
+
+def test_a_string_created_at_is_coerced_like_updated_at(swkb_env):
+    """The same `.isoformat()` at `index.py:149` makes `created_at` reachable
+    exactly like `updated_at`; both are coerced at the service boundary so
+    neither can leave the file written and the index stale."""
+    path = swkb_env["note_file"]
+
+    entry = swkb_env["service"].update_entry(
+        "sample-note", "swkb", created_at="2001-02-03T04:05:06+00:00"
+    )
+
+    assert entry.created_at == datetime(2001, 2, 3, 4, 5, 6, tzinfo=UTC)
+    assert _read_frontmatter(path)["created_at"] == datetime(2001, 2, 3, 4, 5, 6, tzinfo=UTC)
+
+
+def test_a_refreshed_updated_at_is_written_unquoted_without_microseconds(swkb_env):
+    """#173 review: pin the file shape of the refreshed stamp.
+
+    The value has to reach ruamel as a `datetime` so it is written as a plain
+    YAML timestamp -- `updated_at: 2026-… 05:06:07+00:00` -- rather than a
+    quoted `isoformat()` string carrying microseconds. Nothing pinned that
+    shape before this test.
+    """
+    path = swkb_env["note_file"]
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "tags: [alpha]",
+            "tags: [alpha]\nupdated_at: 2020-01-02T00:00:00+00:00",
+        ),
+        encoding="utf-8",
+    )
+
+    swkb_env["service"].update_entry("sample-note", "swkb", tags=["beta"])
+
+    text = path.read_text(encoding="utf-8")
+    line = next(l for l in text.splitlines() if l.startswith("updated_at:"))
+    assert re.fullmatch(r"updated_at: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\+00:00", line), (
+        f"refreshed updated_at has the wrong shape: {line!r}"
+    )
+
+
+ADR_WITH_BARE_DATE = """---
+id: sample-adr-with-bare-date
+type: adr
+title: An ADR whose date is a bare YAML date
+adr_number: 1
+status: accepted
+date: 2025-06-01
+---
+
+Decision body.
+"""
+
+
+def test_a_timestamp_looking_title_edit_through_update_entry_reaches_the_file(swkb_env):
+    """#173 review: the same-instant shortcut must never run for a title.
+
+    The reviewer's case, on the service path the CLI, REST and MCP all take:
+    a title edited from `"2026-01-15"` to `"2026-01-15T00:00:00Z"` reported
+    success and left the old node, so the next index sync silently reverted
+    the edit.
+    """
+    path = swkb_env["note_file"]
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            "title: A core-type note with an undeclared key",
+            'title: "2026-01-15"',
+        ),
+        encoding="utf-8",
+    )
+
+    swkb_env["service"].update_entry("sample-note", "swkb", title="2026-01-15T00:00:00Z")
+
+    assert "2026-01-15T00:00:00Z" in path.read_text(encoding="utf-8"), (
+        "the title edit was swallowed -- the write path kept the old node"
+    )
+
+
+def test_a_date_edit_through_update_entry_reaches_the_file(swkb_env):
+    """#173 review: editing an ADR's `date` to the SAME instant, in a fuller
+    representation, must reach disk.
+
+    `date: 2025-06-01` loads as midnight UTC and the edit supplies the same
+    instant as a datetime. The unscoped same-instant check kept the old node
+    -- the CLI reported success, the file never changed and the index then
+    flipped back to the file's value. Scoped to the timestamp keys, `date` is
+    written like any other changed field.
+    """
+    path = swkb_env["note_file"].parent / "sample-adr-with-bare-date.md"
+    path.write_text(ADR_WITH_BARE_DATE, encoding="utf-8")
+
+    swkb_env["service"].update_entry(
+        "sample-adr-with-bare-date", "swkb", date=datetime(2025, 6, 1, tzinfo=UTC)
+    )
+
+    after = path.read_text(encoding="utf-8")
+    assert "\ndate: 2025-06-01\n" not in after, (
+        "the date edit was swallowed -- the write path kept the bare-date node"
+    )
+    assert "date: 2025-06-01 00:00:00+00:00" in after
+
+
+UNPARSEABLE_CREATED_AT_NODES = {
+    "null": "created_at:\n",
+    "empty-string": "created_at: ''\n",
+    "non-iso-string": "created_at: Jan 15 2026\n",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(UNPARSEABLE_CREATED_AT_NODES))
+def test_a_created_at_that_does_not_parse_is_kept_verbatim(tmp_path, shape):
+    """#173 review: `created_at:` null / `''` / `Jan 15 2026` survive a no-op
+    round trip byte for byte.
+
+    `parse_datetime` falls back to "now" for all three, and the write path
+    emitted that fallback -- replacing a value the file already had with a
+    wrong one, which is worse than the drop this branch fixes. The rule is: a
+    source node that did not parse is kept verbatim.
+    """
+    from pyrite.storage.repository import KBRepository
+
+    kb_path = tmp_path / f"unparseable-created-at-{shape}"
+    kb_path.mkdir(parents=True)
+    path = kb_path / "created-at.md"
+    text = (
+        "---\n"
+        "id: unparseable-created-at\n"
+        "type: note\n"
+        "title: A created_at the loader cannot parse\n"
+        f"{UNPARSEABLE_CREATED_AT_NODES[shape]}"
+        "---\n"
+        "\n"
+        "Body.\n"
+    )
+    path.write_text(text, encoding="utf-8")
+    repo = KBRepository(KBConfig(name=f"unparseable-created-at-{shape}", path=kb_path))
+
+    entry = repo.load_entry_from_file(path)
+    assert entry.created_at is not None  # the in-memory fallback still happens
+    out = repo.save(entry)
+
+    assert out.read_text(encoding="utf-8") == text, (
+        "the write path replaced an unparseable created_at node with its parse fallback"
+    )
+
+
+def test_an_explicit_created_at_assignment_still_reaches_the_file(tmp_path):
+    """The escape hatch for the verbatim rule: an edit is not a no-op.
+
+    A key kept verbatim must still be writable -- assigning `created_at`
+    clears the verbatim flag, exactly as an assignment clears
+    `_absent_default_keys`.
+    """
+    from pyrite.storage.repository import KBRepository
+
+    kb_path = tmp_path / "unparseable-created-at-edit"
+    kb_path.mkdir(parents=True)
+    path = kb_path / "created-at.md"
+    path.write_text(
+        "---\n"
+        "id: unparseable-created-at\n"
+        "type: note\n"
+        "title: A created_at the loader cannot parse\n"
+        "created_at:\n"
+        "---\n"
+        "\n"
+        "Body.\n",
+        encoding="utf-8",
+    )
+    repo = KBRepository(KBConfig(name="unparseable-created-at-edit", path=kb_path))
+
+    entry = repo.load_entry_from_file(path)
+    entry.created_at = datetime(2030, 1, 2, 3, 4, 5, tzinfo=UTC)
+    out = repo.save(entry)
+
+    assert "2030-01-02 03:04:05+00:00" in out.read_text(encoding="utf-8"), (
+        "an explicit created_at assignment was swallowed by the verbatim rule"
+    )
