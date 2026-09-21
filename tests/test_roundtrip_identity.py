@@ -2,13 +2,15 @@
 
 Loading every entry in a KB and saving it back with no edit should change
 nothing on disk. Before PR #69 this rewrote 768 of 768 real `kb/` files;
-#69 brought that down, and this test measured the remainder directly: 58 of
-770 files as of this branch, split across three distinct causes (see
+#69 brought that down, and this test measured the remainder directly: 52 of
+770 files as of this branch, split across two distinct causes (see
 `KNOWN_RESIDUAL_IDS` below -- each group is a separate, precisely-identified
-finding, not one blob). The block-indented `links:` group (11 ids, issue #148)
-is gone: `pyrite/utils/yaml.py` now reads a source document's own sequence
-indentation out of the parsed tree's line/column records and hands the emitter
-those numbers, so a no-op save leaves those files byte-identical.
+finding, not one blob). Two groups are gone: the block-indented `links:` set
+(11 ids, issue #148 -- `pyrite/utils/yaml.py` now reads a source document's own
+sequence indentation out of the parsed tree's line/column records and hands the
+emitter those numbers, so a no-op save leaves those files byte-identical) and
+the `body:` fold set (6 ids, issue #150 -- those files were re-saved through
+the repository, which drops the surviving `body:`/`file_path:` keys).
 
 Every write-path bug in the run-up to this test -- #46 (an incidental
 `--tags` update rewriting the whole file), #86 (`pyrite create` leaking
@@ -132,24 +134,6 @@ LINKS_BARE_STRING_IDS: frozenset[str] = frozenset(
 #    count test still record which class of finding it was.
 GENERIC_METADATA_DUP_IDS: frozenset[str] = frozenset()
 
-# 4. Six files already carry #87's `body:` frontmatter fold as committed,
-#    pre-existing damage -- NOT something this test's own load/save causes.
-#    `body` and `file_path` are in `_BASE_CONSUMED_KEYS` specifically so the
-#    CURRENT write path correctly drops both on any save, which is why the
-#    gate flags these: the file changes (heals) the moment anything saves
-#    it. Filed as issue #150 (data cleanup, not a code fix) rather than
-#    silently mutating tracked kb/ content from this theme's branch.
-PREEXISTING_BODY_FOLD_IDS: frozenset[str] = frozenset(
-    {
-        "ci-run-getting-started-tutorial",
-        "live-server-integration-tests-for-multi-request-flows-plus-regression-tests-for-the-three-outside-prs",
-        "playwright-e2e-suite-non-deterministic-failures-likely-shared-state-auth-config-gap",
-        "playwright-package-c-auth-spec-and-the-auth-enabled-project-decision",
-        "playwright-package-d-entry-crud-and-entry-features-specs",
-        "playwright-package-e-collections-and-daily-specs",
-    }
-)
-
 # 5. Daily notes with more than one trailing blank line in their body.
 #    `Entry.to_markdown` always writes exactly one trailing newline after
 #    the body (a deliberate rule -- see that method's docstring; pre-commit
@@ -177,10 +161,7 @@ TRAILING_BLANK_LINE_NORMALIZE_IDS: frozenset[str] = frozenset(
 # moment any id here stops failing, forcing this list to be updated in the
 # same commit as whatever fixed it).
 KNOWN_RESIDUAL_IDS: frozenset[str] = (
-    LINKS_BARE_STRING_IDS
-    | GENERIC_METADATA_DUP_IDS
-    | PREEXISTING_BODY_FOLD_IDS
-    | TRAILING_BLANK_LINE_NORMALIZE_IDS
+    LINKS_BARE_STRING_IDS | GENERIC_METADATA_DUP_IDS | TRAILING_BLANK_LINE_NORMALIZE_IDS
 )
 
 
@@ -334,20 +315,20 @@ class TestRealKBRoundTrip:
             "and a GitHub issue"
         )
 
-    def test_known_residual_count_is_58(self):
+    def test_known_residual_count_is_52(self):
         """The count, recorded here per #146 acceptance criterion 4 ("the
 
         count in the test's docstring and in the report") as well as in the
-        module docstring: 58 ids as of this branch -- 46 bare-string links +
-        6 pre-existing body: fold + 6 trailing-blank-line normalization.
-        Two groups are empty: the `GenericEntry` metadata duplication group
-        (fixed in #149) and the block-indented `links:` group (fixed in #148).
+        module docstring: 52 ids as of this branch -- 46 bare-string links +
+        6 trailing-blank-line normalization. Three groups are accounted for:
+        the `GenericEntry` metadata duplication group is empty (fixed in
+        #149), and the block-indented `links:` group (fixed in #148) and the
+        `body:` fold group (cleaned in #150) are gone.
         """
         assert len(LINKS_BARE_STRING_IDS) == 46
         assert len(GENERIC_METADATA_DUP_IDS) == 0
-        assert len(PREEXISTING_BODY_FOLD_IDS) == 6
         assert len(TRAILING_BLANK_LINE_NORMALIZE_IDS) == 6
-        assert len(KNOWN_RESIDUAL_IDS) == 58
+        assert len(KNOWN_RESIDUAL_IDS) == 52
 
     # #146 acceptance criterion 4: "xfail(strict=True) on exactly the failing
     # ids with the count in the test's docstring and in the report, so the

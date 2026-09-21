@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import Any, ClassVar
 
 from pyrite.plugins.capabilities import Capability
+from pyrite.plugins.scoping import kb_scope_clause
 
 from .entry_types import UserProfileEntry, WriteupEntry
 from .hooks import (
@@ -176,7 +177,9 @@ class SocialPlugin:
         config = load_config()
         return PyriteDB(config.settings.index_path), True
 
-    def _mcp_top(self, args: dict[str, Any]) -> dict[str, Any]:
+    def _mcp_top(
+        self, args: dict[str, Any], *, readable_kbs: set[str] | None = None
+    ) -> dict[str, Any]:
         """Get highest-voted writeups."""
         import json
 
@@ -194,9 +197,9 @@ class SocialPlugin:
                 WHERE e.entry_type = 'writeup'
             """
             params: list = []
-            if kb_name:
-                query += " AND e.kb_name = ?"
-                params.append(kb_name)
+            clause, scope_params = kb_scope_clause("e.kb_name", kb_name, readable_kbs)
+            query += clause
+            params.extend(scope_params)
             if period == "week":
                 query += " AND v.created_at >= datetime('now', '-7 days')"
             elif period == "month":
@@ -227,7 +230,9 @@ class SocialPlugin:
             if should_close:
                 db.close()
 
-    def _mcp_newest(self, args: dict[str, Any]) -> dict[str, Any]:
+    def _mcp_newest(
+        self, args: dict[str, Any], *, readable_kbs: set[str] | None = None
+    ) -> dict[str, Any]:
         """Get most recent writeups."""
         import json
 
@@ -238,9 +243,9 @@ class SocialPlugin:
         try:
             query = "SELECT * FROM entry WHERE entry_type = 'writeup'"
             params: list = []
-            if kb_name:
-                query += " AND kb_name = ?"
-                params.append(kb_name)
+            clause, scope_params = kb_scope_clause("kb_name", kb_name, readable_kbs)
+            query += clause
+            params.extend(scope_params)
             query += " ORDER BY created_at DESC LIMIT ?"
             params.append(limit)
 
