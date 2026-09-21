@@ -55,6 +55,33 @@ def test_a_small_node_is_not_truncated():
     assert len(result["outlinks"]) == 2
 
 
+def test_a_dangling_link_does_not_crash_the_sort():
+    """A link to a page nobody has written yet is an ordinary state (#63).
+
+    `get_outlinks` LEFT JOINs the target entry, so the link's `title` key is
+    present with the value None -- `.get("title", "")` never returns the
+    default for it, and sorting then compared None with str and raised. A
+    dangling wikilink turned a working tool call into a failure.
+    """
+    dangling = [{"id": "not-written-yet", "title": None, "entry_type": None}]
+    db = _FakeDB(dangling, dangling)
+
+    result = query_network(db, "kb", "hub", limit=50)
+
+    assert [link["id"] for link in result["outlinks"]] == ["not-written-yet"]
+    assert result["totals"] == {"outlinks": 1, "backlinks": 1}
+
+
+def test_a_dangling_link_sorts_with_written_ones_instead_of_raising():
+    links = [{"id": "b", "title": None}, {"id": "a", "title": "A"}]
+    db = _FakeDB(links, [])
+
+    result = query_network(db, "kb", "hub", limit=50)
+
+    # None coerces to "", which sorts before "A" -- deterministic, and no raise.
+    assert [link["id"] for link in result["outlinks"]] == ["b", "a"]
+
+
 def test_offset_walks_without_repeats_or_gaps():
     db = _FakeDB(_links("out", 7), [])
 

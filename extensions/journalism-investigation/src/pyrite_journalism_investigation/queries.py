@@ -142,7 +142,13 @@ def query_network(
         return {"error": f"Entry '{entry_id}' not found"}
 
     def _ordered(links: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return sorted(links, key=lambda link: (link.get("title", ""), link.get("id", "")))
+        # `or ""`, not `.get("title", "")`: `get_outlinks` LEFT JOINs the target
+        # entry, so a link to a page nobody has written yet has the key
+        # *present* with the value None, and a default never fires. Sorting
+        # None against a str raises TypeError, which turned an ordinary
+        # dangling wikilink into a failed tool call. `id` comes from the same
+        # join and gets the same treatment.
+        return sorted(links, key=lambda link: (link.get("title") or "", link.get("id") or ""))
 
     outlinks = _ordered(db.get_outlinks(entry_id, kb_name))
     backlinks = _ordered(db.get_backlinks(entry_id, kb_name))
