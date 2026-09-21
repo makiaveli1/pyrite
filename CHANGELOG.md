@@ -5,26 +5,13 @@ All notable changes to Pyrite will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Unreleased changes are **not** listed below. Each one is a separate file under
+[`changelog.d/`](changelog.d/README.md), named `<slug>.<section>.md`, so that no
+two pull requests conflict on this file; `scripts/release.py` assembles them
+under the version heading when the release is cut. `tests/test_changelog_fragments.py`
+asserts that `[Unreleased]` stays empty.
+
 ## [Unreleased]
-
-### Fixed
-
-- **`pyrite index health` no longer reports a `subdirectory_mismatches` false
-  positive for every entry of a type whose declared subdirectory ends in `/`.**
-  `people/` and `people` are the same directory, but the check compared the
-  declared string against a path component, so a KB created exactly as the
-  getting-started guide instructs came back `status: warning` with one row per
-  entry. Both sides are normalized now, and an entry genuinely in the wrong
-  directory is still flagged (#44).
-
-- **`pyrite create -t <type>` no longer silently files a different type when the
-  KB does not declare the one asked for (#197).** Core types were exempt from
-  the CLI's write-side refusal, so `-t note` against a KB whose schema declares
-  only `adr | backlog_item | component | standard` skipped the guard, and plugin
-  type resolution then promoted it to its most-derived `note` subtype — an ADR
-  with `adr_number: 0` under `kb/adrs/`, from a command that asked for a note.
-  The refusal now covers every type the KB does not declare; `--allow-undeclared`
-  still overrides it.
 
 ## [0.24.3] - 2026-09-20
 
@@ -554,6 +541,11 @@ which Pyrite stops being one person's experiment.
   `VALIDATION_FAILED` instead of a near-empty 200, and the `fields` projection
   always keeps `id` and `kb_name`, so `found` can no longer contradict
   `not_found` (#134).
+
+- KBs removed from `config.yaml` become user-managed on the next registry
+  sync, so `pyrite kb remove` no longer rejects them indefinitely. Existing
+  index data and permissions are preserved; KBs still in the config remain
+  protected (#19).
 - **`kb_batch_read` no longer crashes on a malformed spec, and every `fields`
   projection keeps the identity pair.** A non-list `entries`, a non-object item,
   or a missing, empty or non-string `entry_id`/`kb_name` used to raise a raw
@@ -574,6 +566,16 @@ which Pyrite stops being one person's experiment.
   KB may hold both `2026-01-15T09:00:00` and `2026-01-15T09:00:00+00:00` for
   unchanged files until a full `pyrite index build` makes them uniform;
   ordering and date filters are unaffected ("+" sorts before digits) (#151).
+- **`created_at`/`updated_at`: a file that carried them keeps them, a file
+  that did not never grows them.** `_base_frontmatter` re-emits the two keys
+  only for entries loaded from a file that had them, as second-precision
+  timestamps (`updated_at` only when the caller did not supply one); the
+  internal stamp goes through `Entry.touch_updated_at()` so bookkeeping is
+  not mistaken for a user edit; and unchanged values keep their source node,
+  so a `created_at: 2026-01-15` stays a bare date instead of being rewritten
+  as a timestamp, and a value the loader cannot parse (`created_at:` with no
+  value, `''`, `Jan 15 2026`) is kept exactly as written rather than replaced
+  with the load time (#151).
 - **Two worktrees running the Playwright e2e suite at once collided on the
   same four ports (8088/5173 base, 8189/5274 auth) and could end up talking
   to each other's world.** Ports and data directories are now derived per

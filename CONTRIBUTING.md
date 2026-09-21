@@ -14,7 +14,7 @@ Thank you for considering contributing to Pyrite! This guide will help you get s
 
 ```bash
 # Clone the repository
-git clone https://github.com/markramm/pyrite.git
+git clone https://github.com/pyrite-wiki/pyrite.git
 cd pyrite
 
 # Create virtual environment and install dependencies
@@ -199,7 +199,7 @@ test per command").
 
 A claim with no PR after 5 days lapses. Two people on one issue is fine — the
 first PR that meets the acceptance criteria merges, and we credit the other
-in the CHANGELOG line.
+in the changelog entry for the change.
 
 A placeholder commit or file is not a claim, and we don't merge placeholders.
 
@@ -222,9 +222,9 @@ Commit messages use conventional commits (`feat:`, `fix:`, `docs:`, `test:`,
 
 Two places, one rule — an item lives in exactly one of them (ADR-0033):
 
-- **Bugs and requests → [GitHub Issues](https://github.com/markramm/pyrite/issues).**
+- **Bugs and requests → [GitHub Issues](https://github.com/pyrite-wiki/pyrite/issues).**
   Anyone can file one; use the templates. Issues labelled
-  [`good first issue`](https://github.com/markramm/pyrite/labels/good%20first%20issue)
+  [`good first issue`](https://github.com/pyrite-wiki/pyrite/labels/good%20first%20issue)
   are small, well-specified and a fine place to start.
 - **The roadmap → `kb/`** in this repo: epics, planned work and architecture
   decisions, browsable with the tool itself:
@@ -248,7 +248,12 @@ the ones that arrived on 2026-09-18 from four first-time contributors all did:
   <test> <impl files>` to check exactly that; you can run it too.
 - The full suite green locally: `pytest tests/ extensions/ -n auto`, plus
   `ruff check` and `ruff format --check`.
-- A line in `CHANGELOG.md` under `[Unreleased]`.
+- A changelog fragment: a **new file** `changelog.d/<slug>.<section>.md`
+  containing the bullet as it should read in the release notes. Do **not** edit
+  `CHANGELOG.md` — it is the one file every pull request used to conflict on,
+  and a fragment has a name nobody else picks, so two branches in flight cannot
+  collide. `changelog.d/README.md` lists the sections and shows an example; the
+  release script assembles the fragments when the release is cut.
 - AI-assisted contributions are welcome here. If an AI coding agent wrote or
   co-wrote your change, declare it with a `Co-authored-by:` trailer on the
   commit (most agent tools add this automatically) — it is machine-readable,
@@ -288,7 +293,7 @@ names, for anything that is not yours to publish; no absolute home paths.
 
 Maintainer: Mark Ramm (BDFL; see ADR-0032). Contributors are credited by
 name in the release notes of the release their work ships in (the runbook
-lists every outside author of a merged PR), in the CHANGELOG line for the
+lists every outside author of a merged PR), in the changelog entry for the
 change, and in the README.
 
 ## License

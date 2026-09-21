@@ -46,8 +46,14 @@ never pause it, you change what it will read next tick.
 ## Inputs — evidence, never the conductor's self-report alone
 
 ```bash
-# The tick log: one entry per tick, written by the conductor (kb/notes/conductor-log-<YYYY-Www>.md)
-ls kb/notes/conductor-log-*.md | tail -2
+# The tick log: one entry per tick, written by the conductor. It lives in the
+# `pyrite-desk` KB, NOT in kb/ — the loop's bookkeeping is not addressed to
+# contributors (maintainer, 2026-09-21; it had put 34 of the last 100 commits
+# on dev, all on one file). `desk/` is gitignored here and is intended to
+# become its own private repo; until it does, the log is local to the machine
+# the loop ran on. If it is absent, say so and work from the GitHub evidence
+# below — an absent log is a missing input, never evidence that no ticks ran.
+ls desk/notes/conductor-log-*.md | tail -2
 # Friction filed as it happened (conductor and workers file these; ADR-0033)
 gh issue list --label process --state all --limit 40 --json number,title,createdAt,closedAt
 # Flow: how long themes wait in each lane (draft PR = claim, ready = reviewed, merged = landed)
@@ -95,7 +101,7 @@ list finds only the waste that was loud.
 
 | Waste | What it looks like in this loop | Where to look |
 |---|---|---|
-| Partially done work | branches with no PR; draft PRs whose worker stopped; specs groomed but never dispatched; a merged change with no docs, no CHANGELOG line, no closed ticket | `gh pr list --draft`, `git branch -r`, the architect's last breakdown vs what was dispatched |
+| Partially done work | branches with no PR; draft PRs whose worker stopped; specs groomed but never dispatched; a merged change with no docs, no `changelog.d/` fragment, no closed ticket | `gh pr list --draft`, `git branch -r`, the architect's last breakdown vs what was dispatched |
 | Extra features | a worker's diff beyond its acceptance criteria; a theme pulled forward that the release did not need; skill text nobody reads | the diff vs the spec; the pool vs the DoD; skill lines never cited in a tick |
 | Relearning | a tick re-deriving what the last tick knew; a worker rediscovering a gotcha; the same `process` issue filed twice; the host re-reading a PR because the report did not say | tick-log repetition, `gotchas.md` gaps, `Unsure` lines that an earlier report answered |
 | Handoffs | spec → worker → report → review → PR: each hop where context was lost — a redispatch quoting what the spec "did not say", a review that had to re-run what the report claimed | redispatch reasons, review-lane time vs report quality |
