@@ -152,28 +152,21 @@ OPTIONAL_KB_TOOLS: dict[str, str] = {
         name: _PLUGIN_REFUSAL.format(module=module)
         for module, names in {
             "extensions/journalism-investigation": (
+                # The write-path tools keep the fail-closed listing: a caller
+                # who may write a KB can read it, so the tier guard covers the
+                # read. The two cross-KB tools are narrowed in their own change
+                # (#297). The single-KB read tools that used to sit here filter
+                # by the readable set now.
                 "investigation_bulk_edges",
-                "investigation_claims",
                 "investigation_create_claim",
                 "investigation_create_entity",
                 "investigation_create_event",
-                "investigation_entities",
-                "investigation_evidence_chain",
-                "investigation_export_pack",
                 "investigation_find_duplicates",
-                "investigation_ftm_export",
                 "investigation_ftm_import",
                 "investigation_log_source",
-                "investigation_money_flow",
-                "investigation_network",
-                "investigation_ownership_chain",
                 "investigation_promote_claim",
-                "investigation_qa_report",
                 "investigation_search_all",
-                "investigation_sources",
                 "investigation_start",
-                "investigation_status",
-                "investigation_timeline",
             ),
             "extensions/software-kb": (
                 "sw_adrs",
