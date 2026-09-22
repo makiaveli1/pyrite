@@ -14,10 +14,7 @@ it back in, so they keep holding if the default changes.
 import json
 from pathlib import Path
 
-from pyrite_journalism_investigation.plugin import (
-    _UNREADABLE_KB,
-    JournalismInvestigationPlugin,
-)
+from pyrite_journalism_investigation.plugin import JournalismInvestigationPlugin
 
 from pyrite.storage.database import PyriteDB
 
@@ -32,11 +29,15 @@ class TestReadableKb:
         resolved = plugin._resolve_kb({})
         assert plugin._readable_kb({}, {resolved}) == resolved
 
-    def test_nothing_readable_resolves_to_a_name_that_matches_nothing(self):
-        assert _plugin()._readable_kb({}, set()) == _UNREADABLE_KB
+    def test_nothing_readable_resolves_to_a_private_guard_name(self):
+        assert _plugin()._readable_kb({}, set()).startswith("(unreadable-")
 
-    def test_an_unreadable_default_resolves_to_that_name_too(self):
-        assert _plugin()._readable_kb({}, {"some-other-kb"}) == _UNREADABLE_KB
+    def test_an_unreadable_default_resolves_to_a_private_guard_name_too(self):
+        assert _plugin()._readable_kb({}, {"some-other-kb"}).startswith("(unreadable-")
+
+    def test_each_unreadable_resolution_uses_a_fresh_name(self):
+        plugin = _plugin()
+        assert plugin._readable_kb({}, set()) != plugin._readable_kb({}, set())
 
     def test_an_unscoped_caller_keeps_the_resolved_kb(self):
         plugin = _plugin()
@@ -86,6 +87,14 @@ class TestTheToolsAnswerWithNothingRatherThanTheDefaultKb:
             db.close()
         assert "ev-1" not in out
         assert out.startswith("{"), "the tool keeps its own response shape"
+
+    def test_a_real_kb_named_like_the_old_guard_is_not_served(self, tmp_path):
+        db = _make_db(tmp_path, "(unreadable)", "private-trap")
+        try:
+            out = json.dumps(_plugin_for(db)._mcp_timeline({}, readable_kbs={"some-other-kb"}))
+        finally:
+            db.close()
+        assert "private-trap" not in out
 
     def test_an_unscoped_caller_still_sees_the_default_kb(self, tmp_path):
         resolved = _plugin()._resolve_kb({})

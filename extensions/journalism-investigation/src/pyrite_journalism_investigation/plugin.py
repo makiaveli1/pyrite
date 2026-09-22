@@ -1,5 +1,6 @@
 """Journalism Investigation plugin for pyrite."""
 
+import secrets
 from typing import Any, ClassVar
 
 from pyrite.plugins.capabilities import Capability
@@ -30,10 +31,13 @@ from .queries import (
 from .utils import parse_meta
 from .validators import validate_investigation_entry
 
-# A KB name that matches no entry, used when a scoped caller may not read the KB
-# a tool resolves to (#223). A *name* rather than None on purpose: None is how
-# the query functions spell "every KB", so passing it would serve the index.
-_UNREADABLE_KB = "(unreadable)"
+# Prefix for the fresh guard name used when a scoped caller may not read the KB
+# a tool resolves to (#223). KB names are unrestricted, so a fixed public name
+# could itself be a real KB and serve its entries. A fresh unguessable name on
+# every denied call cannot be registered ahead of use. It remains a *name*
+# rather than None on purpose: None is how the query functions spell "every
+# KB", so passing it would serve the index.
+_UNREADABLE_KB_PREFIX = "(unreadable-"
 
 
 class JournalismInvestigationPlugin:
@@ -90,7 +94,7 @@ class JournalismInvestigationPlugin:
         kb = self._resolve_kb(args)
         if readable_kbs is None or kb in readable_kbs:
             return kb
-        return _UNREADABLE_KB
+        return f"{_UNREADABLE_KB_PREFIX}{secrets.token_hex(32)})"
 
     def _scoped_kb_names(
         self, requested: list[str] | None, readable_kbs: set[str] | None
