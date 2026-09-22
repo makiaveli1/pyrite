@@ -187,6 +187,11 @@ OPTIONAL_KB_TOOLS: dict[str, str] = {
                 "sw_standards",
                 "sw_validations",
             ),
+            "extensions/encyclopedia": (
+                "wiki_quality_stats",
+                "wiki_review_queue",
+                "wiki_stubs",
+            ),
         }.items()
         for name in names
     },
