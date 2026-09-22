@@ -23,9 +23,10 @@ from pyrite.storage.database import PyriteDB
 PUBLIC, PRIVATE = "public-kb", "private-kb"
 
 # Every handler that was in OPTIONAL_KB_TOOLS for this extension, with the entry
-# type it reads. `_mcp_create_adr` is absent on purpose: it writes an ADR, so a
-# behavioural test would create one; its read (finding the next ADR number) is
-# narrowed by the same helper as `_mcp_adrs`, which is covered here.
+# type it reads. `_mcp_create_adr` is absent on purpose: it returns an ADR
+# number and filename suggestion rather than rows, so the row-output assertions
+# below do not describe it. Its read (finding the next ADR number) is narrowed
+# by the same helper as `_mcp_adrs`, which is covered here.
 SW_SURFACES = [
     ("_mcp_adrs", "adr"),
     ("_mcp_component", "component"),
