@@ -154,18 +154,15 @@ OPTIONAL_KB_TOOLS: dict[str, str] = {
             "extensions/journalism-investigation": (
                 # The write-path tools keep the fail-closed listing: a caller
                 # who may write a KB can read it, so the tier guard covers the
-                # read. The two cross-KB tools are narrowed in their own change
-                # (#297). The single-KB read tools that used to sit here filter
-                # by the readable set now.
+                # read. The cross-KB and single-KB read tools filter by the
+                # readable set now.
                 "investigation_bulk_edges",
                 "investigation_create_claim",
                 "investigation_create_entity",
                 "investigation_create_event",
-                "investigation_find_duplicates",
                 "investigation_ftm_import",
                 "investigation_log_source",
                 "investigation_promote_claim",
-                "investigation_search_all",
                 "investigation_start",
             ),
             "extensions/software-kb": (
@@ -181,18 +178,6 @@ OPTIONAL_KB_TOOLS: dict[str, str] = {
                 "sw_review_queue",
                 "sw_standards",
                 "sw_validations",
-            ),
-            "extensions/cascade": (
-                "cascade_actors",
-                "cascade_capture_lanes",
-                "cascade_timeline",
-                "solidarity_infrastructure_types",
-                "solidarity_timeline",
-            ),
-            "extensions/encyclopedia": (
-                "wiki_quality_stats",
-                "wiki_review_queue",
-                "wiki_stubs",
             ),
         }.items()
         for name in names
