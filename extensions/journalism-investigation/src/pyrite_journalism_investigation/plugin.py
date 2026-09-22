@@ -30,7 +30,6 @@ from .queries import (
 from .utils import parse_meta
 from .validators import validate_investigation_entry
 
-
 # A KB name that matches no entry, used when a scoped caller may not read the KB
 # a tool resolves to (#223). A *name* rather than None on purpose: None is how
 # the query functions spell "every KB", so passing it would serve the index.
