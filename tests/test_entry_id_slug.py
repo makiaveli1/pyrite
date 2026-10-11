@@ -56,6 +56,17 @@ def test_non_string_yaml_scalar_titles_are_stringified_before_slugging():
         assert SAFE.match(generate_entry_id(value)), repr(value)
 
 
+def test_titles_that_cannot_be_indexed_get_no_id():
+    # #762 review item 2: a sequence, mapping or NaN title must stay out of id
+    # derivation with a named reason, so `ids pin` never writes an id into a
+    # file Pyrite cannot index (list titles are #711).
+    import math
+
+    for value in (["a", "b"], (1, 2), {"a": 1}, math.nan):
+        with pytest.raises(TypeError):
+            generate_entry_id(value)
+
+
 def test_accents_transliterate_instead_of_vanishing():
     assert generate_entry_id("Café résumé naïve") == "cafe-resume-naive"
 

@@ -250,6 +250,83 @@ def test_missing_exits_three_and_reports_each_kind(kb):
     assert all(r["reason"] for r in data["skipped"])
 
 
+def test_titles_the_index_rejects_stay_skipped_with_a_reason(kb):
+    # #762 review item 2: a list, mapping or NaN title derives no id, so
+    # `ids missing` keeps listing these files as skipped (with a reason,
+    # not a traceback) and `ids pin` never writes an id into them (#711).
+    root, config = kb
+    _write(
+        root,
+        {
+            "ok.md": "---\ntitle: Fine\n---\n",
+            "listtitle.md": "---\ntitle: [a, b]\n---\n",
+            "dicttitle.md": "---\ntitle: {a: 1}\n---\n",
+            "nantitle.md": "---\ntitle: .nan\n---\n",
+        },
+    )
+    result = _run(config, "ids", "missing", "-k", "notes", "--format", "json")
+    assert result.exit_code == OUTSIDE_CONTRACT, result.output
+    data = _json(result)
+    # ok.md has a derivable id and no index row, so it is the one real finding
+    assert [(r["path"], r["id"]) for r in data["missing"]] == [("ok.md", "fine")]
+    assert {r["path"] for r in data["skipped"]} == {
+        "listtitle.md",
+        "dicttitle.md",
+        "nantitle.md",
+    }
+    assert all(r["reason"] for r in data["skipped"])
+    assert data["collisions"] == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="ids pin refuses to write on Windows")
+def test_pin_never_writes_an_id_into_a_title_the_index_rejects(kb):
+    # #762 review item 2, the pin half: the refused files are skipped, so pin
+    # pins the good file and writes nothing into the other three.
+    root, config = kb
+    _write(
+        root,
+        {
+            "ok.md": "---\ntitle: Fine\n---\n",
+            "listtitle.md": "---\ntitle: [a, b]\n---\n",
+            "dicttitle.md": "---\ntitle: {a: 1}\n---\n",
+            "nantitle.md": "---\ntitle: .nan\n---\n",
+        },
+    )
+    _commit(root)
+    pin = _run(config, "ids", "pin", "-k", "notes", "--format", "json")
+    data = _json(pin)
+    assert [p["path"] for p in data["pinned"]] == ["ok.md"]
+    assert _numstat(root) == {"ok.md": ("1", "0")}
+
+
+def test_falsy_titles_carry_their_own_ids_and_parsed_collisions_are_reported(kb):
+    # #762 review items 3 and 4: `title: false` / `0` / `0.0` used to fall
+    # through the empty-title check to the `entry-da39a3ee` hash; they now
+    # use their own slug. The id comes from the parsed value, not the source
+    # text, so `1.10` and `1.1` collide and `ids missing` reports it.
+    root, config = kb
+    _write(
+        root,
+        {
+            "zero.md": "---\ntitle: 0\n---\n",
+            "nofalse.md": "---\ntitle: false\n---\n",
+            "zeropoint.md": "---\ntitle: 0.0\n---\n",
+            "one10.md": "---\ntitle: 1.10\n---\n",
+            "one1.md": "---\ntitle: 1.1\n---\n",
+        },
+    )
+    data = _json(_run(config, "ids", "missing", "-k", "notes", "--format", "json"))
+    found = {(r["path"], r["id"]) for r in data["missing"]}
+    assert ("zero.md", "0") in found
+    assert ("nofalse.md", "false") in found
+    assert ("zeropoint.md", "0-0") in found
+    assert all(id_ != "entry-da39a3ee" for _p, id_ in found)
+
+    [group] = data["collisions"]
+    assert group["id"] == "1-1"
+    assert sorted(c["path"] for c in group["claimants"]) == ["one1.md", "one10.md"]
+
+
 def test_missing_text_output_names_paths_and_ids(kb):
     root, config = kb
     _write(root, {"n/one.md": "---\ntitle: One Two\n---\n"})

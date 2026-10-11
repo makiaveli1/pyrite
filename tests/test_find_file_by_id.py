@@ -273,6 +273,51 @@ def test_704_numeric_title_is_indexed_and_findable(kb, raw_title, derived):
     assert repo.find_file(row_id) == f
 
 
+# -- #704: the stored title says the same thing as the id ----------------------
+
+
+@pytest.mark.parametrize(
+    ("raw_title", "derived", "stored"),
+    [
+        ("true", "true", "true"),
+        ("false", "false", "false"),
+        ("0", "0", "0"),
+        ("0.0", "0-0", "0.0"),
+        ("2024", "2024", "2024"),
+        ("1e3", "1000-0", "1000.0"),
+    ],
+)
+def test_704_stored_title_agrees_with_the_id(kb, raw_title, derived, stored):
+    # #762 review item 1: only the slug used to be stringified, so `title: true`
+    # got id `true` but the row held SQLite's reading of the raw bool ("1").
+    # The load path now stringifies once, so the id, the stored title and
+    # `get` all say the same thing.
+    kb_path, svc, _repo, db = kb
+    f = kb_path / f"num-{derived}.md"
+    f.write_text(f"---\ntype: note\ntitle: {raw_title}\n---\n\nb\n")
+    _index(svc, db)
+    rows = db.list_entries(kb_name=KB)
+
+    (row,) = rows
+    assert row["id"] == derived
+    assert row["title"] == stored
+
+
+def test_704_a_title_the_index_cannot_store_is_not_indexed(kb):
+    # #762 review item 2: a list, mapping or NaN title never reaches the row
+    # write. The load refuses it with a named reason, so there is no row and
+    # no id -- instead of a sqlite ProgrammingError traceback (#711).
+    kb_path, svc, _repo, db = kb
+    (kb_path / "fine.md").write_text("---\ntype: note\ntitle: Fine\n---\n\nb\n")
+    for name, raw in (("lt.md", "[a, b]"), ("dt.md", "{a: 1}"), ("nan.md", ".nan")):
+        (kb_path / name).write_text(f"---\ntype: note\ntitle: {raw}\n---\n\nb\n")
+    _index(svc, db)
+    rows = {r["id"]: r for r in db.list_entries(kb_name=KB)}
+
+    assert set(rows) == {"fine"}
+    assert all(isinstance(r["title"], str) for r in rows.values())
+
+
 # -- a rejected filename hit says which id the file holds ----------------------
 
 
