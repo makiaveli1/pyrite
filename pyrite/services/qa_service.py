@@ -932,9 +932,13 @@ class QAService:
                 shown = file_path
             self._check_reserved_key_collisions(issues, kb_name, entry, shown)
             self._check_task_priority(issues, kb_name, entry, shown)
-            self._check_non_string_title(issues, kb_name, entry, shown)
             if entry._source_frontmatter is not None:
                 sources[entry.id] = entry._source_frontmatter
+        if entry_id is None:
+            # The single-entry path looks up the file through the index, which
+            # never holds a row for a file that cannot load; only the KB-wide
+            # pass reads every file and can see it.
+            self._check_non_string_titles(issues, kb_name, repo, kb_config)
         return sources
 
     def _check_schema_retypes_core_fields(self, issues: list[dict[str, Any]], kb_name: str) -> None:
@@ -1009,38 +1013,55 @@ class QAService:
         )
 
     @staticmethod
-    def _check_non_string_title(
-        issues: list[dict[str, Any]], kb_name: str, entry: Any, shown: Any
+    def _check_non_string_titles(
+        issues: list[dict[str, Any]], kb_name: str, repo: Any, kb_config: Any
     ) -> None:
-        """Report a file whose ``title`` is not a string (#711).
+        """Report a file whose ``title`` is a list, a mapping or NaN (#711).
 
-        A YAML-list title (often the old comma split in ``-f``/``--title``
-        parsing) loads as a list. The model keeps it as-is so validation
-        can report it; only the file shows what was written, since the
-        index row write fails. Scalar non-strings (``title: 2024``) are
-        stringified at id time (#704) and are not reported here.
+        The loader refuses such a title before an id can be derived, so the
+        entry pass above never sees these files: this reads each file's own
+        frontmatter directly. A scalar title (``title: 2024``) is stringified
+        at load (#704) and is not reported here. The path in the message is the
+        handle to use: no index row exists for such a file.
         """
-        source = entry._source_frontmatter or {}
-        value = source.get("title", getattr(entry, "title", ""))
-        if isinstance(value, str) or value is None or value == "":
-            return
-        if isinstance(value, (list, tuple, dict)):
-            kind = type(value).__name__
-        else:
-            return
-        issues.append(
-            {
-                "entry_id": entry.id,
-                "kb_name": kb_name,
-                "rule": "non_string_title",
-                "severity": "error",
-                "field": "title",
-                "message": (
-                    f"{shown}: title is a {kind}, not a string; quote it "
-                    f"as a single line so it can be indexed (#711)."
-                ),
-            }
-        )
+        from ..utils.frontmatter import Frontmatter, split_frontmatter
+        from ..utils.yaml import load_yaml
+
+        for file_path in repo.list_files():
+            try:
+                text = file_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            split = split_frontmatter(text)
+            if not isinstance(split, Frontmatter):
+                continue
+            fm = load_yaml(split.text)
+            if not isinstance(fm, dict) or "title" not in fm:
+                continue
+            title = fm["title"]
+            if isinstance(title, (list, tuple, dict)):
+                kind = "a mapping" if isinstance(title, dict) else "a list"
+            elif isinstance(title, float) and title != title:
+                kind = "NaN"
+            else:
+                continue
+            try:
+                shown = file_path.relative_to(kb_config.path)
+            except ValueError:
+                shown = file_path
+            issues.append(
+                {
+                    "entry_id": "",
+                    "kb_name": kb_name,
+                    "rule": "non_string_title",
+                    "severity": "error",
+                    "field": "title",
+                    "message": (
+                        f"{shown}: title is {kind}, not a string; pyrite "
+                        f"cannot index it. Quote it as a single line (#711)."
+                    ),
+                }
+            )
 
     @staticmethod
     def _check_reserved_key_collisions(
