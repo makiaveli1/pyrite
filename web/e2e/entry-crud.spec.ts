@@ -10,9 +10,10 @@ import { E2E_BACKEND_URL } from './global-setup';
  *
  * This spec CREATES entries (the New Entry flow). Every title it writes comes
  * from `uniqueTitle()` so a second run of the same seeded world, and any
- * sibling spec running in the same pass, never collides with it. Each test
- * that creates an entry deletes it in a `finally` via the backend API — there
- * is no delete affordance in the web UI to drive instead (see the report).
+ * sibling spec running in the same pass, never collides with it. Cleanup uses
+ * the backend API even though the detail page now has a delete affordance
+ * (#117): a spec's own teardown must not depend on UI behaviour under test
+ * elsewhere, and the API delete needs no seeded session state.
  */
 
 // Per-worktree, not a hardcoded 8088 — see E2E_BACKEND_URL's own doc (#118).

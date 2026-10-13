@@ -1,11 +1,23 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { render, screen, fireEvent, cleanup } from '@testing-library/svelte';
+import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/svelte';
 import DeleteEntryButton from './DeleteEntryButton.svelte';
 
+const MockApiError = vi.hoisted(() => {
+	return class MockApiError extends Error {
+		status: number;
+		detail: string;
+		constructor(status: number, detail: string) {
+			super(`API Error ${status}: ${detail}`);
+			this.status = status;
+			this.detail = detail;
+		}
+	};
+});
 vi.mock('$lib/api/client', () => ({
 	api: {
 		deleteEntry: vi.fn()
-	}
+	},
+	ApiError: MockApiError
 }));
 
 vi.mock('$lib/stores/ui.svelte', () => ({
@@ -14,7 +26,7 @@ vi.mock('$lib/stores/ui.svelte', () => ({
 	}
 }));
 
-import { api } from '$lib/api/client';
+import { api, ApiError } from '$lib/api/client';
 import { uiStore } from '$lib/stores/ui.svelte';
 
 const mockDeleteEntry = vi.mocked(api.deleteEntry);
@@ -27,48 +39,100 @@ afterEach(() => {
 
 function setup() {
 	const onDeleted = vi.fn();
-	render(DeleteEntryButton, { props: { entryId: 'hub', kbName: 'demo', onDeleted } });
+	render(DeleteEntryButton, {
+		props: { entryId: 'hub', kbName: 'demo', entryTitle: 'Hub Design', onDeleted }
+	});
 	return { onDeleted };
 }
 
 describe('DeleteEntryButton', () => {
 	it('renders a Delete button with an accessible name', () => {
 		setup();
-		expect(screen.getByRole('button', { name: 'Delete entry' })).toBeInTheDocument();
+		expect(screen.getByRole('button', { name: 'Delete' })).toBeInTheDocument();
 	});
 
-	it('asks for confirmation in place instead of deleting immediately', async () => {
+	it('keeps Delete in place, disabled, beside the confirm step', async () => {
 		setup();
-		await fireEvent.click(screen.getByRole('button', { name: 'Delete entry' }));
+		const del = screen.getByRole('button', { name: 'Delete' });
+		await fireEvent.click(del);
+		const kept = screen.getByRole('button', { name: 'Delete' });
+		expect(kept).toBe(del);
+		expect(kept).toBeDisabled();
 		expect(screen.getByRole('button', { name: 'Confirm delete' })).toBeInTheDocument();
-		expect(screen.getByRole('button', { name: 'Cancel delete' })).toBeInTheDocument();
+		expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument();
 		expect(mockDeleteEntry).not.toHaveBeenCalled();
 	});
 
-	it('cancel sends no request and restores the Delete button', async () => {
+	it('a double-click on Delete cannot confirm: the second click lands on a disabled button', async () => {
 		setup();
-		await fireEvent.click(screen.getByRole('button', { name: 'Delete entry' }));
-		await fireEvent.click(screen.getByRole('button', { name: 'Cancel delete' }));
+		const del = screen.getByRole('button', { name: 'Delete' });
+		await fireEvent.click(del);
+		await fireEvent.click(del);
+		await fireEvent.click(del);
 		expect(mockDeleteEntry).not.toHaveBeenCalled();
-		expect(screen.getByRole('button', { name: 'Delete entry' })).toBeInTheDocument();
+	});
+
+	it('names the entry and KB being deleted in the confirm step', async () => {
+		setup();
+		await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+		expect(screen.getByText(/Hub Design/)).toBeInTheDocument();
+		expect(screen.getByText(/demo/)).toBeInTheDocument();
 	});
 
 	it('confirm calls deleteEntry with the entry id and kb, then calls onDeleted', async () => {
 		const { onDeleted } = setup();
 		mockDeleteEntry.mockResolvedValue({ deleted: true, id: 'hub' });
-		await fireEvent.click(screen.getByRole('button', { name: 'Delete entry' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
 		await fireEvent.click(screen.getByRole('button', { name: 'Confirm delete' }));
+		await waitFor(() => expect(onDeleted).toHaveBeenCalledTimes(1));
 		expect(mockDeleteEntry).toHaveBeenCalledWith('hub', 'demo');
-		expect(onDeleted).toHaveBeenCalledTimes(1);
 	});
 
-	it('shows an error toast and stays on the entry when the API fails', async () => {
+	it('cancel sends no request, restores Delete, and returns focus to it', async () => {
+		setup();
+		await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+		expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Confirm delete' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+		expect(mockDeleteEntry).not.toHaveBeenCalled();
+		const del = screen.getByRole('button', { name: 'Delete' });
+		expect(del).toBeEnabled();
+		expect(document.activeElement).toBe(del);
+	});
+
+	it('a second click while deleting cannot fire a second request', async () => {
 		const { onDeleted } = setup();
-		mockDeleteEntry.mockRejectedValue(new Error('forbidden'));
-		await fireEvent.click(screen.getByRole('button', { name: 'Delete entry' }));
+		let release!: (v: { deleted: boolean; id: string }) => void;
+		mockDeleteEntry.mockImplementation(
+			() => new Promise((resolve) => (release = resolve))
+		);
+		await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+		const confirm = screen.getByRole('button', { name: 'Confirm delete' });
+		await fireEvent.click(confirm);
+		await fireEvent.click(confirm);
+		await fireEvent.click(confirm);
+		expect(mockDeleteEntry).toHaveBeenCalledTimes(1);
+		release({ deleted: true, id: 'hub' });
+		await waitFor(() => expect(onDeleted).toHaveBeenCalledTimes(1));
+	});
+
+	it('shows the server reason on refusal and keeps the reader on the entry', async () => {
+		const { onDeleted } = setup();
+		mockDeleteEntry.mockRejectedValue(new ApiError(403, 'not yours to delete'));
+		await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
 		await fireEvent.click(screen.getByRole('button', { name: 'Confirm delete' }));
+		await waitFor(() =>
+			expect(mockToast).toHaveBeenCalledWith('Could not delete: not yours to delete', 'error')
+		);
 		expect(onDeleted).not.toHaveBeenCalled();
-		expect(mockToast).toHaveBeenCalledWith('Could not delete entry', 'error');
-		expect(screen.getByRole('button', { name: 'Delete entry' })).toBeInTheDocument();
+		expect(screen.getByRole('button', { name: 'Delete' })).toBeEnabled();
+	});
+
+	it('treats a 404 as already deleted: toast, then leave the entry', async () => {
+		const { onDeleted } = setup();
+		mockDeleteEntry.mockRejectedValue(new ApiError(404, 'gone'));
+		await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+		await fireEvent.click(screen.getByRole('button', { name: 'Confirm delete' }));
+		await waitFor(() => expect(onDeleted).toHaveBeenCalledTimes(1));
+		expect(mockToast).toHaveBeenCalledWith('Entry was already deleted', 'info');
 	});
 });

@@ -35,7 +35,10 @@
 	const entryId = $derived($page.params.id as string);
 
 	onMount(() => {
-		entryStore.loadEntry(entryId);
+		// The kb the link named is authoritative for what is shown and what a
+		// delete would remove; without it, two KBs holding the same id make the
+		// entry on screen a different entry than the one a link pointed at.
+		entryStore.loadEntry(entryId, $page.url.searchParams.get('kb') ?? undefined);
 
 		function handleKeydown(e: KeyboardEvent) {
 			if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'B') {
@@ -277,7 +280,13 @@
 										<DeleteEntryButton
 											entryId={entryStore.current?.id ?? ''}
 											kbName={entryStore.current?.kb_name ?? ''}
-											onDeleted={() => goto('/entries')}
+											entryTitle={entryStore.current?.title ?? ''}
+										onDeleted={() => {
+											// The reader deleted in this KB; land back in the same
+											// one, not in whatever KB the entries list defaults to.
+											const kb = entryStore.current?.kb_name ?? '';
+											goto(kb ? `/entries?kb=${encodeURIComponent(kb)}` : '/entries');
+										}}
 										/>
 									{/if}
 										{#if editing}
