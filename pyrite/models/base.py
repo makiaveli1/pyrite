@@ -510,14 +510,14 @@ class Entry(ABC):
         from ..schema import generate_entry_id
         from ..utils.parse import safe_int
 
-        title = meta.get("title", "")
+        title = raw_title = meta.get("title", "")
         # A YAML title that is a scalar (2024, true, 1.5, a date) is stored as
         # the string it prints as, so the derived id, the stored title and
         # `get` agree (#704) instead of the id saying "true" while the row
         # holds SQLite's reading of the raw bool. A title that is a mapping,
         # a sequence or NaN is refused with a named reason: the file cannot be
         # indexed (#711), so it stays skipped by the ids and index paths and
-        # is reported by `pyrite qa`. This fires before the explicit-id check
+        # `ids missing` lists it as skipped. This fires before the explicit-id check
         # so an `id:` line cannot smuggle an unindexable title into the index.
         if isinstance(title, (list, tuple, dict)):
             kind = "a mapping" if isinstance(title, dict) else "a list"
@@ -530,7 +530,10 @@ class Entry(ABC):
             title = str(title)
         entry_id = meta.get("id", "")
         if not entry_id:
-            entry_id = generate_entry_id(title)
+            # From the raw value: a falsy scalar (`0`, `false`, `0.0`) derives
+            # the empty-title id it always had, so an upgrade moves no id. Its
+            # stored title is still the stringified value (#704).
+            entry_id = generate_entry_id(raw_title)
 
         prov_data = meta.get("provenance")
         provenance = Provenance.from_dict(prov_data) if prov_data else None

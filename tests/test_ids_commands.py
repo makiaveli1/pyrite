@@ -274,11 +274,19 @@ def test_titles_the_index_rejects_stay_skipped_with_a_reason(kb):
         "dicttitle.md",
         "nantitle.md",
     }
-    assert all(r["reason"] for r in data["skipped"])
+    reasons = {r["path"]: r["reason"] for r in data["skipped"]}
+    assert reasons == {
+        "listtitle.md": "title must be a string, got a list",
+        "dicttitle.md": "title must be a string, got a mapping",
+        "nantitle.md": "title must be a string, got NaN",
+    }
     assert data["collisions"] == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason="ids pin refuses to write on Windows")
+@pytest.mark.control(
+    reason="dev already skips these files via the same TypeError; pins the refusal"
+)
 def test_pin_never_writes_an_id_into_a_title_the_index_rejects(kb):
     # #762 review item 2, the pin half: the refused files are skipped, so pin
     # pins the good file and writes nothing into the other three.
@@ -299,32 +307,68 @@ def test_pin_never_writes_an_id_into_a_title_the_index_rejects(kb):
     assert _numstat(root) == {"ok.md": ("1", "0")}
 
 
-def test_falsy_titles_carry_their_own_ids_and_parsed_collisions_are_reported(kb):
-    # #762 review items 3 and 4: `title: false` / `0` / `0.0` used to fall
-    # through the empty-title check to the `entry-da39a3ee` hash; they now
-    # use their own slug. The id comes from the parsed value, not the source
-    # text, so `1.10` and `1.1` collide and `ids missing` reports it.
+def test_falsy_titles_keep_the_id_dev_gave_them_and_collisions_are_reported(kb):
+    # #762: `title: false` / `0` / `0.0` / `-0` fell through the empty-title
+    # check to the `entry-da39a3ee` hash on dev. They keep it, so an upgrade
+    # moves no id and breaks no link. The limit: two such files share that id,
+    # and `ids missing` reports the collision. The id also comes from the
+    # parsed value, so `1.10` and `1.1` collide.
     root, config = kb
     _write(
         root,
         {
             "zero.md": "---\ntitle: 0\n---\n",
             "nofalse.md": "---\ntitle: false\n---\n",
-            "zeropoint.md": "---\ntitle: 0.0\n---\n",
             "one10.md": "---\ntitle: 1.10\n---\n",
             "one1.md": "---\ntitle: 1.1\n---\n",
         },
     )
     data = _json(_run(config, "ids", "missing", "-k", "notes", "--format", "json"))
     found = {(r["path"], r["id"]) for r in data["missing"]}
-    assert ("zero.md", "0") in found
-    assert ("nofalse.md", "false") in found
-    assert ("zeropoint.md", "0-0") in found
-    assert all(id_ != "entry-da39a3ee" for _p, id_ in found)
+    assert ("zero.md", "entry-da39a3ee") in found
+    assert ("nofalse.md", "entry-da39a3ee") in found
 
-    [group] = data["collisions"]
-    assert group["id"] == "1-1"
-    assert sorted(c["path"] for c in group["claimants"]) == ["one1.md", "one10.md"]
+    groups = {g["id"]: sorted(c["path"] for c in g["claimants"]) for g in data["collisions"]}
+    assert groups == {
+        "1-1": ["one1.md", "one10.md"],
+        "entry-da39a3ee": ["nofalse.md", "zero.md"],
+    }
+
+
+def test_collision_check_reports_two_falsy_titles_sharing_an_id():
+    from pathlib import Path
+
+    from pyrite.cli.schema_commands import detect_id_collisions
+
+    errors = detect_id_collisions(
+        [
+            (Path("a.md"), {"type": "note", "title": 0}),
+            (Path("b.md"), {"type": "note", "title": False}),
+        ]
+    )
+    assert len(errors) == 2
+    assert all("entry-da39a3ee" in e["message"] for e in errors)
+
+
+@pytest.mark.control(
+    reason="ids never builds an entry for an explicit id, so dev already behaves this way; pins it"
+)
+def test_explicit_id_with_an_unindexable_title_is_not_reported_as_missing(kb):
+    # On dev an `id:` line let a list or NaN title through to the index write,
+    # which crashed. Now the index refuses the file; `ids` has nothing to pin
+    # (the id is explicit), reports no collision, and writes nothing.
+    root, config = kb
+    _write(
+        root,
+        {
+            "ok.md": "---\ntitle: Fine\n---\n",
+            "listid.md": "---\nid: list-id\ntitle: [a, b]\n---\n",
+            "nanid.md": "---\nid: nan-id\ntitle: .nan\n---\n",
+        },
+    )
+    data = _json(_run(config, "ids", "missing", "-k", "notes", "--format", "json"))
+    assert [(r["path"], r["id"]) for r in data["missing"]] == [("ok.md", "fine")]
+    assert data["collisions"] == []
 
 
 def test_missing_text_output_names_paths_and_ids(kb):

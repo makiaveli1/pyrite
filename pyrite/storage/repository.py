@@ -298,13 +298,25 @@ class KBRepository:
         answers this (ADR-0038 decision 1) -- with this KB's schema
         migrations applied first, as ``_load_entry`` applies them.
         """
+        return self.read_id(file_path)[0]
+
+    def read_id(self, file_path: Path) -> tuple[str | None, str | None]:
+        """``id_of_file`` with the reason: ``(id, None)``, or ``(None, why)``
+        where ``why`` is the loader's own message (``title must be a string,
+        got a list``), or None when the file simply holds no entry."""
         try:
             if file_path.name == "__collection.yaml":
-                return self._load_collection(file_path).id or None
-            return read_entry_id(file_path.read_text(encoding="utf-8"), migrate=self._maybe_migrate)
+                return self._load_collection(file_path).id or None, None
+            return (
+                read_entry_id(file_path.read_text(encoding="utf-8"), migrate=self._maybe_migrate),
+                None,
+            )
         except Exception as e:
             logger.warning("Skipping unreadable file during id lookup: %s (%s)", file_path, e)
-            return None
+            # One line, KB-relative: a ruamel message spans lines and may name
+            # an absolute path, and this text is shown to the user.
+            why = (str(e).splitlines() or [""])[0].replace(f"{self.path}/", "")
+            return None, why or type(e).__name__
 
     def find_file(self, entry_id: str) -> Path | None:
         """The file that holds ``entry_id``, or None (ADR-0038 I8).

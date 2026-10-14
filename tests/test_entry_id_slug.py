@@ -49,13 +49,17 @@ def test_non_string_yaml_scalar_titles_are_stringified_before_slugging():
     assert generate_entry_id(2024) == "2024"
     assert generate_entry_id(1000.0) == "1000-0"
     assert generate_entry_id(True) == "true"
-    assert generate_entry_id(False) == "false"
-    assert generate_entry_id(0) == "0"
+    # falsy scalars keep the empty-title id they had before #704: no id moves
+    assert generate_entry_id(False) == generate_entry_id("") == "entry-da39a3ee"
+    assert generate_entry_id(0) == generate_entry_id(0.0) == "entry-da39a3ee"
     assert generate_entry_id(None).startswith("entry-")
     for value in (2024, 1000.0, True, False, 0):
         assert SAFE.match(generate_entry_id(value)), repr(value)
 
 
+@pytest.mark.control(
+    reason="dev already skips these files via the same TypeError; pins the refusal"
+)
 def test_titles_that_cannot_be_indexed_get_no_id():
     # #762 review item 2: a sequence, mapping or NaN title must stay out of id
     # derivation with a named reason, so `ids pin` never writes an id into a

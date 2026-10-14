@@ -280,9 +280,6 @@ def test_704_numeric_title_is_indexed_and_findable(kb, raw_title, derived):
     ("raw_title", "derived", "stored"),
     [
         ("true", "true", "true"),
-        ("false", "false", "false"),
-        ("0", "0", "0"),
-        ("0.0", "0-0", "0.0"),
         ("2024", "2024", "2024"),
         ("1e3", "1000-0", "1000.0"),
     ],
@@ -303,6 +300,50 @@ def test_704_stored_title_agrees_with_the_id(kb, raw_title, derived, stored):
     assert row["title"] == stored
 
 
+@pytest.mark.parametrize(
+    ("raw_title", "stored"), [("0", "0"), ("false", "false"), ("0.0", "0.0"), ("-0", "0")]
+)
+def test_704_falsy_title_keeps_the_id_it_had_on_dev(kb, raw_title, stored):
+    # A title YAML reads as a falsy scalar fell through the empty-title check
+    # to the `entry-da39a3ee` hash on dev. Upgrading must move no id (links
+    # stay valid), so the id stays; only the stored title is the stringified
+    # value.
+    kb_path, svc, repo, db = kb
+    f = kb_path / "falsy.md"
+    f.write_text(f"---\ntype: note\ntitle: {raw_title}\n---\n\nb\n")
+    _index(svc, db)
+
+    (row,) = db.list_entries(kb_name=KB)
+    assert row["id"] == "entry-da39a3ee"
+    assert row["title"] == stored
+    assert repo.id_of_file(f) == row["id"]
+    assert repo.find_file(row["id"]) == f
+
+
+def test_704_unindexable_title_with_an_explicit_id_is_not_indexed(kb):
+    # On dev an `id:` line skipped the title check, so a list or NaN title
+    # reached the row write and crashed it (sqlite3.ProgrammingError).
+    kb_path, svc, _repo, db = kb
+    (kb_path / "fine.md").write_text("---\ntype: note\ntitle: Fine\n---\n\nb\n")
+    for name, raw in (("lt.md", "[a, b]"), ("dt.md", "{a: 1}"), ("nan.md", ".nan")):
+        (kb_path / name).write_text(f"---\ntype: note\nid: x-{name[:2]}\ntitle: {raw}\n---\n\nb\n")
+    from pyrite.storage.index import IndexManager
+
+    result = IndexManager(db, svc.config).reconcile_kb(svc.config.get_kb(KB), force=True)
+    rows = {r["id"] for r in db.list_entries(kb_name=KB)}
+
+    assert rows == {"fine"}
+    # reported with the loader's reason, not a driver error naming SQL binding
+    assert {m["path"].rsplit("/", 1)[1]: m["error"] for m in result["malformed"]} == {
+        "lt.md": "title must be a string, got a list",
+        "dt.md": "title must be a string, got a mapping",
+        "nan.md": "title must be a string, got NaN",
+    }
+
+
+@pytest.mark.control(
+    reason="dev already skips these files via the same TypeError; pins the refusal"
+)
 def test_704_a_title_the_index_cannot_store_is_not_indexed(kb):
     # #762 review item 2: a list, mapping or NaN title never reaches the row
     # write. The load refuses it with a named reason, so there is no row and
@@ -345,3 +386,19 @@ def test_494_delete_of_a_collection_still_removes_its_yaml(kb):
     assert repo.find_file("collection-notes") == yaml_file
     assert repo.delete("collection-notes")
     assert not yaml_file.exists()
+
+
+def test_704_skip_reason_is_one_line_and_kb_relative(kb, monkeypatch):
+    # The reason shown by `ids missing` is the loader's message cut to its
+    # first line, with this KB's absolute path made relative.
+    import pyrite.storage.repository as repository_module
+
+    kb_path, _svc, repo, _db = kb
+    f = kb_path / "x.md"
+    f.write_text("---\ntype: note\ntitle: X\n---\n\nb\n")
+
+    def boom(*_a, **_k):
+        raise ValueError(f"bad value in {f}\n  line 2 detail\n  line 3")
+
+    monkeypatch.setattr(repository_module, "read_entry_id", boom)
+    assert repo.read_id(f) == (None, "bad value in x.md")

@@ -1686,6 +1686,10 @@ HANDLERS: dict[tuple[str, str], tuple[str, str]] = {
         "a class that cannot be inspected is skipped; failures counted exit 1",
     ),
     ("pyrite/cli/protocol_commands.py", "protocol_list"): ("safe", "registry fallback"),
+    ("pyrite/cli/schema_commands.py", "detect_id_collisions"): (
+        "safe",
+        "a title that derives no id (list, mapping, NaN) has nothing to collide; qa reports it (#711)",
+    ),
     ("pyrite/cli/schema_commands.py", "_get_git_changed_md_files"): (
         "safe",
         "no git means no changed-file filter",

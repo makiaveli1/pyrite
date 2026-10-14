@@ -59,15 +59,16 @@ def generate_entry_id(title: Any) -> str:
       ``title: true``) is stringified before slugging (#704), so the file
       is indexed instead of silently skipped. The id comes from the value
       YAML parsed, not the source text, so spellings that parse equal
-      (``1.10`` and ``1.1``, ``1e3`` and ``1000.0``) collide; ``ids missing``
+      (``1.10`` and ``1.1``, ``1e3`` and ``1000.0``, ``.inf`` and ``-.inf`` both ``inf``) collide; ``ids missing``
       reports the collision. A title that is a mapping, a sequence or NaN
       raises ``TypeError`` with a named reason (#711): the ids and index
-      paths skip such a file with that reason, and ``pyrite qa`` reports it.
+      paths skip such a file with that reason.
 
-    Plain ASCII string titles produce exactly what they always did. Titles
-    that YAML reads as ``false`` or ``0`` used to fall through the empty
-    check to the ``entry-da39a3ee`` hash and now use their own slug; see
-    the changelog. Every place that turns a title into a filename must use
+    Plain ASCII string titles produce exactly what they always did. A title
+    YAML reads as a falsy scalar (``false``, ``0``, ``0.0``, ``-0``) keeps the
+    ``entry-da39a3ee`` empty-title id it had before #704, so upgrading moves
+    no id and breaks no link; the limit is that two such files share that id,
+    which ``ids missing`` reports as a collision. Every place that turns a title into a filename must use
     this function (the ``sw new-adr`` CLI and MCP tool once let ``/`` and
     ``:`` through).
     """
@@ -79,7 +80,9 @@ def generate_entry_id(title: Any) -> str:
         raise TypeError(f"cannot derive an id: title is a {type(title).__name__}")
     if isinstance(title, float) and math.isnan(title):
         raise TypeError("cannot derive an id: title is NaN")
-    if title is None:
+    if not title:
+        # None, "" and falsy scalars (0, False, 0.0) all slug as the empty
+        # title, as they did before #704, so no existing id moves.
         title_str = ""
     elif isinstance(title, str):
         title_str = title

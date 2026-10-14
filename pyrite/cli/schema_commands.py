@@ -238,9 +238,11 @@ def detect_id_collisions(
     for file_path, fm in entries:
         entry_id = fm.get("id", "")
         if not entry_id:
-            title = fm.get("title", "")
-            if title:
-                entry_id = generate_entry_id(title)
+            try:
+                entry_id = generate_entry_id(fm.get("title", ""))
+            except TypeError:
+                # a list, mapping or NaN title: no id to collide (#711)
+                entry_id = ""
         if entry_id:
             entry_type = fm.get("type", "unknown")
             id_map[entry_id].append((file_path, entry_type))
