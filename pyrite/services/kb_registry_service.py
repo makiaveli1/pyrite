@@ -202,6 +202,8 @@ class KBRegistryService:
 
         If ``kb_type`` matches a registered plugin preset, the preset is
         materialized into the KB directory (kb.yaml, subdirectories, templates).
+        A directory that already has a kb.yaml is registered as it stands and
+        nothing is written inside it (#945).
 
         Raises KBAlreadyExistsError (a ConfigError) if a KB with the same
         name already exists.
@@ -272,6 +274,14 @@ class KBRegistryService:
         if not preset:
             return
 
+        # A kb.yaml means this directory is already a KB (#945), so it is being
+        # registered, not created. Registering must not write inside it: Pyrite
+        # is additive to hand maintenance, and a scaffold belongs to `init` or
+        # to an explicit request, not to registering what is already there.
+        if (kb_path / "kb.yaml").exists():
+            logger.info("KB '%s' already has a kb.yaml, leaving its files alone", name)
+            return
+
         logger.info("Applying preset '%s' to KB '%s'", kb_type, name)
 
         # Build kb.yaml content
@@ -305,11 +315,10 @@ class KBRegistryService:
         if types_section:
             kb_yaml["types"] = types_section
 
-        # Write kb.yaml
+        # Write kb.yaml. Absent by the early return above, so no guard here.
         kb_yaml_path = kb_path / "kb.yaml"
-        if not kb_yaml_path.exists():
-            dump_yaml_file(kb_yaml, kb_yaml_path)
-            logger.info("Wrote kb.yaml for KB '%s'", name)
+        dump_yaml_file(kb_yaml, kb_yaml_path)
+        logger.info("Wrote kb.yaml for KB '%s'", name)
 
         # Create subdirectories
         for dirname in preset.get("directories", []):
