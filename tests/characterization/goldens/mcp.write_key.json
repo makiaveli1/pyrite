@@ -747,10 +747,10 @@
     "not_found": []
   },
   "kb_batch_suggest | write_key | missing-kb": {
-    "count": "<ENUMERATION_CONTENT>",
-    "pairs": [],
-    "source_kb": "missing-kb",
-    "target_kb": "missing-kb"
+    "error": "KB not found: missing-kb",
+    "error_code": "KB_NOT_FOUND",
+    "legacy_error_code": "NOT_FOUND",
+    "retryable": false
   },
   "kb_batch_suggest | write_key | no-default-role-kb": {
     "count": "<ENUMERATION_CONTENT>",
@@ -870,10 +870,10 @@
     "entry_id": "characterization-disposable-mutation-target"
   },
   "kb_discover_neighbors | write_key | missing-kb": {
-    "count": "<ENUMERATION_CONTENT>",
-    "discoveries": [],
-    "entry_id": "characterization-missing-entry",
-    "kb_name": "missing-kb"
+    "error": "KB not found: missing-kb",
+    "error_code": "KB_NOT_FOUND",
+    "legacy_error_code": "NOT_FOUND",
+    "retryable": false
   },
   "kb_discover_neighbors | write_key | no-default-role-kb": {
     "count": "<ENUMERATION_CONTENT>",
@@ -970,10 +970,10 @@
     "entries": []
   },
   "kb_get | write_key | missing-kb": {
-    "error": "Entry 'characterization-missing-entry' not found",
-    "error_code": "NOT_FOUND",
-    "retryable": false,
-    "suggestion": "Use kb_list_entries or kb_search to find entries"
+    "error": "KB not found: missing-kb",
+    "error_code": "KB_NOT_FOUND",
+    "legacy_error_code": "NOT_FOUND",
+    "retryable": false
   },
   "kb_get | write_key | no-default-role-kb": {
     "entry": {
@@ -981,6 +981,7 @@
       "assignee": null,
       "backlinks": [],
       "body": "a zebra of no fixed abode",
+      "content_hash": "fe7dc60f356dd2997276b0c2e28444db5334e02d626e49d4f617c57c97f33716",
       "coordinates": null,
       "created_at": "<TIMESTAMP>",
       "created_by": null,
@@ -1015,6 +1016,7 @@
       "assignee": null,
       "backlinks": [],
       "body": "a zebra behind the wall",
+      "content_hash": "0b3eb8d547f96ecac571def342dbb93479b96410fcddef62f2510886021c5173",
       "coordinates": null,
       "created_at": "<TIMESTAMP>",
       "created_by": null,
@@ -1049,6 +1051,7 @@
       "assignee": null,
       "backlinks": [],
       "body": "a zebra in the open",
+      "content_hash": "75a0ede94d46612f5bd4f9a26fc86dfcf7c40ce08024dae647c9bece56e9e2c1",
       "coordinates": null,
       "created_at": "<TIMESTAMP>",
       "created_by": null,
@@ -1080,24 +1083,28 @@
   "kb_index_sync | write_key | missing-kb": {
     "added": "<ENUMERATION_CONTENT>",
     "removed": "<ENUMERATION_CONTENT>",
+    "skipped": [],
     "synced": "<ENUMERATION_CONTENT>",
     "updated": "<ENUMERATION_CONTENT>"
   },
   "kb_index_sync | write_key | no-default-role-kb": {
     "added": "<ENUMERATION_CONTENT>",
     "removed": "<ENUMERATION_CONTENT>",
+    "skipped": [],
     "synced": "<ENUMERATION_CONTENT>",
     "updated": "<ENUMERATION_CONTENT>"
   },
   "kb_index_sync | write_key | private-kb": {
     "added": "<ENUMERATION_CONTENT>",
     "removed": "<ENUMERATION_CONTENT>",
+    "skipped": [],
     "synced": "<ENUMERATION_CONTENT>",
     "updated": "<ENUMERATION_CONTENT>"
   },
   "kb_index_sync | write_key | readable-kb": {
     "added": "<ENUMERATION_CONTENT>",
     "removed": "<ENUMERATION_CONTENT>",
+    "skipped": [],
     "synced": "<ENUMERATION_CONTENT>",
     "updated": "<ENUMERATION_CONTENT>"
   },
@@ -1300,6 +1307,8 @@
         "actor_reference": "Event references an actor (resolved from string or wikilink)",
         "advised_by": "Advised by another entity",
         "advises": "Advisory relationship",
+        "amended_by": "An ADR is amended by a later one",
+        "amends": "A later ADR amends an earlier one",
         "answers_question": "Answers a question",
         "asks_question": "Poses a question",
         "authored": "Authorship",
@@ -1637,6 +1646,8 @@
         "actor_reference": "Event references an actor (resolved from string or wikilink)",
         "advised_by": "Advised by another entity",
         "advises": "Advisory relationship",
+        "amended_by": "An ADR is amended by a later one",
+        "amends": "A later ADR amends an earlier one",
         "answers_question": "Answers a question",
         "asks_question": "Poses a question",
         "authored": "Authorship",
@@ -1974,6 +1985,8 @@
         "actor_reference": "Event references an actor (resolved from string or wikilink)",
         "advised_by": "Advised by another entity",
         "advises": "Advisory relationship",
+        "amended_by": "An ADR is amended by a later one",
+        "amends": "A later ADR amends an earlier one",
         "answers_question": "Answers a question",
         "asks_question": "Poses a question",
         "authored": "Authorship",
@@ -2286,27 +2299,35 @@
   },
   "kb_qa_assess | write_key | missing-kb": {
     "assessed": "<ENUMERATION_CONTENT>",
+    "failed": [],
     "kb_name": "missing-kb",
     "results": [],
-    "skipped": "<ENUMERATION_CONTENT>"
+    "skipped": "<ENUMERATION_CONTENT>",
+    "tasks_failed": []
   },
   "kb_qa_assess | write_key | no-default-role-kb": {
     "assessed": "<ENUMERATION_CONTENT>",
+    "failed": [],
     "kb_name": "no-default-role-kb",
     "results": "<ENUMERATION_CONTENT>",
-    "skipped": "<ENUMERATION_CONTENT>"
+    "skipped": "<ENUMERATION_CONTENT>",
+    "tasks_failed": []
   },
   "kb_qa_assess | write_key | private-kb": {
     "assessed": "<ENUMERATION_CONTENT>",
+    "failed": [],
     "kb_name": "private-kb",
     "results": "<ENUMERATION_CONTENT>",
-    "skipped": "<ENUMERATION_CONTENT>"
+    "skipped": "<ENUMERATION_CONTENT>",
+    "tasks_failed": []
   },
   "kb_qa_assess | write_key | readable-kb": {
     "assessed": "<ENUMERATION_CONTENT>",
+    "failed": [],
     "kb_name": "readable-kb",
     "results": "<ENUMERATION_CONTENT>",
-    "skipped": "<ENUMERATION_CONTENT>"
+    "skipped": "<ENUMERATION_CONTENT>",
+    "tasks_failed": []
   },
   "kb_qa_status | write_key | missing-kb": {
     "coverage": "<ENUMERATION_CONTENT>",
@@ -2447,6 +2468,8 @@
       "actor_reference": "Event references an actor (resolved from string or wikilink)",
       "advised_by": "Advised by another entity",
       "advises": "Advisory relationship",
+      "amended_by": "An ADR is amended by a later one",
+      "amends": "A later ADR amends an earlier one",
       "answers_question": "Answers a question",
       "asks_question": "Poses a question",
       "authored": "Authorship",
@@ -2761,6 +2784,8 @@
       "actor_reference": "Event references an actor (resolved from string or wikilink)",
       "advised_by": "Advised by another entity",
       "advises": "Advisory relationship",
+      "amended_by": "An ADR is amended by a later one",
+      "amends": "A later ADR amends an earlier one",
       "answers_question": "Answers a question",
       "asks_question": "Poses a question",
       "authored": "Authorship",
@@ -3075,6 +3100,8 @@
       "actor_reference": "Event references an actor (resolved from string or wikilink)",
       "advised_by": "Advised by another entity",
       "advises": "Advisory relationship",
+      "amended_by": "An ADR is amended by a later one",
+      "amends": "A later ADR amends an earlier one",
       "answers_question": "Answers a question",
       "asks_question": "Poses a question",
       "authored": "Authorship",
@@ -3364,12 +3391,24 @@
   "kb_search | write_key | missing-kb": {
     "count": "<ENUMERATION_CONTENT>",
     "has_more": "<ENUMERATION_CONTENT>",
+    "keyword_match": "none",
+    "legs_run": [
+      "keyword"
+    ],
+    "match": "none",
+    "match_basis": "keyword: nothing matched",
     "query": "zebra",
     "results": []
   },
   "kb_search | write_key | no-default-role-kb": {
     "count": "<ENUMERATION_CONTENT>",
     "has_more": "<ENUMERATION_CONTENT>",
+    "keyword_match": "all_terms",
+    "legs_run": [
+      "keyword"
+    ],
+    "match": "strong",
+    "match_basis": "keyword: every term matched",
     "query": "zebra",
     "results": [
       {
@@ -3381,6 +3420,12 @@
   "kb_search | write_key | private-kb": {
     "count": "<ENUMERATION_CONTENT>",
     "has_more": "<ENUMERATION_CONTENT>",
+    "keyword_match": "all_terms",
+    "legs_run": [
+      "keyword"
+    ],
+    "match": "strong",
+    "match_basis": "keyword: every term matched",
     "query": "zebra",
     "results": [
       {
@@ -3392,6 +3437,12 @@
   "kb_search | write_key | readable-kb": {
     "count": "<ENUMERATION_CONTENT>",
     "has_more": "<ENUMERATION_CONTENT>",
+    "keyword_match": "all_terms",
+    "legs_run": [
+      "keyword"
+    ],
+    "match": "strong",
+    "match_basis": "keyword: every term matched",
     "query": "zebra",
     "results": [
       {
@@ -3470,8 +3521,9 @@
   },
   "kb_update | write_key | missing-kb": {
     "error": "KB not found: missing-kb",
-    "error_code": "UPDATE_FAILED",
-    "retryable": true
+    "error_code": "KB_NOT_FOUND",
+    "legacy_error_code": "UPDATE_FAILED",
+    "retryable": false
   },
   "kb_update | write_key | no-default-role-kb": {
     "entry_id": "characterization-disposable-mutation-target",

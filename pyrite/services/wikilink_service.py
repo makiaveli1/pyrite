@@ -9,7 +9,9 @@ import logging
 from typing import Any
 
 from ..config import PyriteConfig
+from ..exceptions import AmbiguousEntryError
 from ..storage.database import PyriteDB
+from .access_policy import named_kb
 
 logger = logging.getLogger(__name__)
 
@@ -79,11 +81,24 @@ class WikilinkService:
         """The KB a ``prefix:`` names -- a shortname or a KB name -- if the
         caller may read it. An unreadable KB is answered as an unknown
         prefix, which is what a KB that does not exist gets."""
-        kb_by_short = self.config.get_kb_by_shortname(prefix)
-        name = kb_by_short.name if kb_by_short else (prefix if self.config.get_kb(prefix) else None)
+        name = self.config.kb_name_for(prefix)
+        if not self.config.get_kb(name):
+            name = None
         if name is None or (readable_kbs is not None and name not in readable_kbs):
             return None
         return name
+
+    def _one_or_ambiguous(self, rows: list[dict[str, Any]], target: str) -> dict[str, Any] | None:
+        """The one row a pass found, or None; rows from more than one KB are
+        refused (``AMBIGUOUS``), never picked by order (#528, #912). Several
+        rows in one KB are that KB's own and keep the first, by id."""
+        held = {r["kb_name"] for r in rows}
+        if len(held) > 1:
+            # Candidates in config order, as every other surface lists them.
+            raise AmbiguousEntryError(
+                target, [k.name for k in self.config.all_kbs() if k.name in held]
+            )
+        return rows[0] if rows else None
 
     def resolve_entry(
         self,
@@ -92,7 +107,10 @@ class WikilinkService:
         *,
         readable_kbs: set[str] | None,
     ) -> dict[str, Any] | None:
-        """Resolve a wikilink target to an entry. Supports kb:id format for cross-KB links."""
+        """Resolve a wikilink target to an entry. Supports kb:id format for cross-KB links.
+
+        ``kb_name`` may be a shortname. An id, title or alias held by more
+        than one readable KB (with none named) is refused, in every pass."""
         # Parse cross-KB format
         actual_target = target
         actual_kb = kb_name
@@ -102,19 +120,26 @@ class WikilinkService:
             if prefixed:
                 actual_target = rest
                 actual_kb = prefixed
+        actual_kb = named_kb(actual_kb)  # a blank names no KB
+        if actual_kb:
+            actual_kb = self.config.kb_name_for(actual_kb)  # a shortname names its KB
         scope_sql, scope_params = _scope_clause("kb_name", readable_kbs)
 
-        # First pass: exact ID match
+        # First pass: exact ID match. Without a KB, an id held by more than
+        # one readable KB is refused, never picked (#528, #912): the caller
+        # embedding ![[kb-b:dup]] must not get kb-a's body. The title and
+        # alias passes below apply the same rule (`_one_or_ambiguous`).
         sql = "SELECT id, kb_name, entry_type, title FROM entry WHERE id = :target"
         params: dict[str, Any] = {"target": actual_target, **scope_params}
         if actual_kb:
             sql += " AND kb_name = :kb_name"
             params["kb_name"] = actual_kb
-        sql += scope_sql + " LIMIT 1"
+        sql += scope_sql + " ORDER BY kb_name"
 
         rows = self.db.execute_sql(sql, params)
-        if rows:
-            return rows[0]
+        picked = self._one_or_ambiguous(rows, actual_target)
+        if picked:
+            return picked
 
         # Second pass: title match
         sql = "SELECT id, kb_name, entry_type, title FROM entry WHERE title LIKE :target"
@@ -122,11 +147,12 @@ class WikilinkService:
         if actual_kb:
             sql += " AND kb_name = :kb_name"
             params["kb_name"] = actual_kb
-        sql += scope_sql + " LIMIT 1"
+        sql += scope_sql + " ORDER BY kb_name, id"
 
         rows = self.db.execute_sql(sql, params)
-        if rows:
-            return rows[0]
+        picked = self._one_or_ambiguous(rows, actual_target)
+        if picked:
+            return picked
 
         # Third pass: search aliases
         sql = """
@@ -137,10 +163,10 @@ class WikilinkService:
         if actual_kb:
             sql += " AND kb_name = :kb_name"
             params["kb_name"] = actual_kb
-        sql += scope_sql + " LIMIT 1"
+        sql += scope_sql + " ORDER BY kb_name, id"
 
         rows = self.db.execute_sql(sql, params)
-        return rows[0] if rows else None
+        return self._one_or_ambiguous(rows, actual_target)
 
     def resolve_batch(
         self,
@@ -159,7 +185,10 @@ class WikilinkService:
         for t in targets:
             if ":" in t and not t.startswith("http"):
                 # Resolve cross-KB targets individually
-                resolved = self.resolve_entry(t, kb_name, readable_kbs=readable_kbs)
+                try:
+                    resolved = self.resolve_entry(t, kb_name, readable_kbs=readable_kbs)
+                except AmbiguousEntryError:
+                    resolved = {}  # held by several KBs: it exists
                 result[t] = resolved is not None
             else:
                 simple_targets.append(t)
@@ -230,6 +259,9 @@ class WikilinkService:
             target_id, target_kb, ref_count, references (list of
             {source_id, source_kb, relation})
         """
+        # A KB that does not exist is refused, not reported as clean (#846).
+        if kb_name is not None:
+            self.config.require_kb(kb_name)
         # Get per-link rows, then group in Python for nested structure
         sql = """
             SELECT l.source_id, l.source_kb, l.target_id, l.target_kb, l.relation

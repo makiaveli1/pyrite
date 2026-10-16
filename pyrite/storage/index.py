@@ -6,9 +6,11 @@ Supports incremental updates based on file modification times.
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
+import stat as stat_module
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -71,16 +73,103 @@ def _strip_code_regions(text: str) -> str:
     return stripped
 
 
+def content_hash(raw: bytes) -> str:
+    """THE ``content_hash``: SHA-256 of a file's raw bytes (ADR-0042 decision 9).
+
+    The index records it per row; a single-entry read returns it for the bytes
+    it read. One definition, so the two can be compared.
+    """
+    return hashlib.sha256(raw).hexdigest()
+
+
 def _hash_file(file_path: Path) -> str | None:
-    """SHA-256 of a file's raw bytes, or None if it can't be read.
+    """``content_hash`` of a file, or None if it can't be read.
 
     Used for content-based staleness detection: mtime alone misses
     same-second edits and coarse-resolution filesystems.
     """
     try:
-        return hashlib.sha256(file_path.read_bytes()).hexdigest()
+        return content_hash(file_path.read_bytes())
     except OSError:
         return None
+
+
+#: The entry columns of a read, in the order the backend's row puts them
+#: (``base_backend._entry_to_dict``) between ``file_path`` and ``metadata``.
+_READ_COLUMNS = (
+    "date",
+    "importance",
+    "status",
+    "location",
+    "lifecycle",
+    "assignee",
+    "assigned_at",
+    "priority",
+    "due_date",
+    "start_date",
+    "end_date",
+    "coordinates",
+)
+
+#: Metadata keys the backend lifts to the top of a row (Tier A 1200, r1175).
+_LIFTED_METADATA_KEYS = ("rank", "effort", "kind", "status_reason", "parked_awaiting")
+
+#: What a read keeps from the index row whatever the file says: the index's
+#: own bookkeeping and the derived link list (decision 9: derived values may
+#: lag, like search; outlinks and backlinks come from the index too).
+_ROW_ONLY_KEYS = ("indexed_at", "created_by", "modified_by")
+
+
+def _as_text(value: Any) -> Any:
+    """``value`` as a TEXT column returns it once SQLite has stored it: a YAML
+    number or date as its text, a bool as ``"1"``/``"0"`` (sqlite3 binds a
+    bool as an integer). ``str`` of a date or datetime is the ISO text
+    sqlite3's adapters write."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return str(int(value))
+    return str(value)
+
+
+def _as_column(key: str, value: Any) -> Any:
+    """``value`` as the index column ``key`` returns it.
+
+    ``importance`` is an INTEGER column and the model has already made it an
+    int; the rest of ``_READ_COLUMNS`` are TEXT (``storage/models.py``), so
+    ``priority: 2.5`` reads back as ``"2.5"`` and ``status: true`` as ``"1"``.
+    The pin test in ``tests/test_get_reads_the_file.py`` compares unquoted
+    dates, bools, floats and nulls with a real row.
+    """
+    return value if key == "importance" else _as_text(value)
+
+
+def _read_sources(
+    sources: list[dict[str, Any]], entry_id: str, kb_name: str, row: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """The file's sources in the shape a row returns them (``_get_entry_sources``).
+
+    ``id`` is the index's row number for a source; the file has none. It is
+    kept from the row where the row's source at the same position says the
+    same thing, so an unchanged source reads exactly as before; otherwise None.
+    """
+    indexed = row.get("sources") or []
+    out = []
+    for i, src in enumerate(sources):
+        shaped = {
+            "id": None,
+            "entry_id": entry_id,
+            "kb_name": kb_name,
+            "title": src.get("title", ""),
+            "url": src.get("url", ""),
+            "outlet": src.get("outlet", ""),
+            "date": src.get("date", ""),
+            "verified": 1 if src.get("verified") else 0,
+        }
+        if i < len(indexed) and {**indexed[i], "id": None} == shaped:
+            shaped["id"] = indexed[i].get("id")
+        out.append(shaped)
+    return out
 
 
 def _is_valid_link_target(target: str) -> bool:
@@ -187,6 +276,7 @@ class ReconcilePlan:
     winners: dict[str, _Claim] = field(default_factory=dict)
     duplicates: list[dict[str, Any]] = field(default_factory=list)
     malformed: list[dict[str, str]] = field(default_factory=list)
+    skipped: list[dict[str, str]] = field(default_factory=list)
     holders: dict[str, list[_Claim]] = field(default_factory=dict)
     walked: int = 0
 
@@ -558,6 +648,70 @@ class IndexManager:
 
         return data
 
+    def read_fields(
+        self,
+        entry: Entry,
+        kb_name: str,
+        file_path: Path,
+        *,
+        content_hash: str,
+        row: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """A single-entry read of ``entry``, parsed from ``file_path`` just now.
+
+        The same keys, in the same order, with the same values a row indexed
+        from this parse would return (``PyriteDB.get_entry``): the entry is
+        projected by ``_entry_to_dict`` -- the index's own projection -- and
+        then shaped as the backend shapes a row. Every file-held value comes
+        from this one parse, so a read never pairs a new body with an old title.
+        From ``row`` come only what the index alone knows: ``indexed_at``,
+        ``created_by``, ``modified_by``, the derived ``links``, and a
+        timestamp the file does not carry (whose value is the time of
+        indexing, #670). ``content_hash`` names the bytes the entry was parsed
+        from. ``tests/test_get_reads_the_file.py`` pins that on a fresh index
+        this equals the row, key for key; the backend's shaping is mirrored,
+        not shared, because it reads an ORM row (a finding for #730 P5).
+        """
+        from ..utils.json_utils import SafeEncoder
+
+        data = self._entry_to_dict(entry, kb_name, file_path, content_hash=content_hash)
+        row = row or {}
+        # Stored as JSON (upsert_entry), so a read sees JSON's values: a date
+        # becomes its ISO string, a tuple a list.
+        metadata = json.loads(json.dumps(data.get("metadata") or {}, cls=SafeEncoder))
+        result: dict[str, Any] = {
+            "id": data["id"],
+            "kb_name": kb_name,
+            "entry_type": data["entry_type"],
+            "title": data["title"],
+            "body": data["body"],
+            "summary": data["summary"],
+            "file_path": data["file_path"],
+        }
+        for key in _READ_COLUMNS:
+            result[key] = _as_column(key, data.get(key))
+        result["lifecycle"] = result["lifecycle"] or "active"
+        result["metadata"] = metadata
+        # A timestamp the file does not carry (or carries unparsed) is not the
+        # file's: the model fills it with "now", which would change on every
+        # read. The row's value stands, as before (#670).
+        source = entry._source_frontmatter or {}
+        for key in ("created_at", "updated_at"):
+            from_file = key in source and key not in entry._unparsed_timestamp_keys
+            result[key] = data.get(key) if from_file else row.get(key)
+        for key in _ROW_ONLY_KEYS:
+            result[key] = row.get(key)
+        for key in _LIFTED_METADATA_KEYS:
+            if key in metadata and key not in result:
+                result[key] = metadata[key]
+        # As _sync_tags stores them: falsy skipped, duplicates (by ==, so
+        # ``1`` and ``true`` are one) dropped first-wins, names as TEXT.
+        result["tags"] = [_as_text(t) for t in dict.fromkeys(t for t in data["tags"] if t)]
+        result["sources"] = _read_sources(data["sources"], entry.id, kb_name, row)
+        result["links"] = row.get("links", [])
+        result["content_hash"] = content_hash
+        return result
+
     # -----------------------------------------------------------------
     # One reconcile (ADR-0038 step 2). Every path that indexes a KB's files
     # -- `index_kb` (pyrite index build, init, the rebuild job),
@@ -574,6 +728,7 @@ class IndexManager:
         *,
         force: bool | Iterable[Path] = False,
         indexed: dict[str, dict[str, Any]] | None = None,
+        verify: bool = False,
     ) -> ReconcilePlan:
         """Read the files and decide which file holds each id. Writes nothing.
 
@@ -583,7 +738,8 @@ class IndexManager:
         other file is parsed -- new paths, changed files, and the losing copies
         of a duplicate, which never have a row -- and one that fails to parse
         is listed in ``malformed``. ``force`` (True, or a set of paths) parses
-        those files whatever their stat says.
+        those files whatever their stat says. With verify=True, known files
+        whose stat still matches are hashed and reparsed when content differs.
         """
         repo = KBRepository(kb_config)
         if indexed is None:
@@ -608,13 +764,31 @@ class IndexManager:
         for rel, file_path in files:
             plan.walked += 1
             try:
-                stat = file_path.stat()
+                # Follow symlinks to preserve existing reads from regular-file targets.
+                file_stat = file_path.stat()
             except OSError:
                 continue  # removed while walking: as if never seen
+            if not stat_module.S_ISREG(file_stat.st_mode):
+                plan.skipped.append({"path": str(file_path), "reason": "not a regular file"})
+                logger.warning("Skipping %s: not a regular file", file_path)
+                continue
             known = path_to_row.get(str(file_path))
             must_read = force is True or (forced is not None and file_path in forced)
-            if known and not must_read and not _file_changed(known[1], stat):
-                claim = _Claim(rel, file_path, known[0], stat)
+            stat_changed = known is None or _file_changed(known[1], file_stat)
+            if known and not must_read and not stat_changed and verify:
+                current_hash = _hash_file(file_path)
+                if current_hash is None:
+                    error = (
+                        "Could not hash file for verification; keeping the existing indexed entry"
+                    )
+                    plan.malformed.append({"path": str(file_path), "error": error})
+                    logger.warning("%s: %s", error, file_path)
+                    claim = _Claim(rel, file_path, known[0], file_stat)
+                    plan.holders.setdefault(claim.entry_id, []).append(claim)
+                    continue
+                must_read = current_hash != known[1].get("content_hash")
+            if known and not must_read and not stat_changed:
+                claim = _Claim(rel, file_path, known[0], file_stat)
             else:
                 try:
                     entry = repo.load_entry_from_file(file_path)
@@ -624,7 +798,7 @@ class IndexManager:
                     plan.malformed.append({"path": str(file_path), "error": str(e)})
                     logger.warning("Could not parse %s: %s", file_path, e)
                     continue
-                claim = _Claim(rel, file_path, id_text(entry.id), stat, entry)
+                claim = _Claim(rel, file_path, id_text(entry.id), file_stat, entry)
             plan.holders.setdefault(claim.entry_id, []).append(claim)
 
         for entry_id, claims in plan.holders.items():
@@ -647,6 +821,7 @@ class IndexManager:
         kb_config: KBConfig,
         *,
         force: bool | Iterable[Path] = False,
+        verify: bool = False,
         enrich: Callable[[Entry, Path, dict[str, Any]], Callable[[], None] | None] | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> dict[str, Any]:
@@ -664,15 +839,16 @@ class IndexManager:
         return a callable to run after (attribution writes ``entry_version``).
 
         Returns ``added``, ``updated``, ``removed`` (row counts), ``malformed``
-        (``{"path", "error"}``), ``duplicates`` (``{"kb", "id", "winner",
-        "paths"}``, KB-relative paths, the winner first) and ``written`` (rows
-        written, counted or not).
+        (``{"path", "error"}``), ``skipped`` (non-regular paths and reasons),
+        ``duplicates`` (``{"kb", "id", "winner", "paths"}``, KB-relative
+        paths, the winner first) and ``written`` (rows written, counted or not).
         """
         results: dict[str, Any] = {
             "added": 0,
             "updated": 0,
             "removed": 0,
             "malformed": [],
+            "skipped": [],
             "duplicates": [],
             "written": 0,
         }
@@ -688,8 +864,12 @@ class IndexManager:
             description=kb_config.description,
         )
         indexed = self._load_indexed_state(kb_config.name)
-        plan = self.plan_reconcile(kb_config, force=force, indexed=indexed)
+        if verify:
+            plan = self.plan_reconcile(kb_config, force=force, indexed=indexed, verify=True)
+        else:
+            plan = self.plan_reconcile(kb_config, force=force, indexed=indexed)
         results["malformed"] = plan.malformed
+        results["skipped"] = plan.skipped
         results["duplicates"] = plan.duplicates
 
         total = len(plan.winners)
@@ -961,9 +1141,10 @@ class IndexManager:
           enough for the search path.
         - broken_links: count of link rows with an unresolvable target
         - undeclared_types: entries whose `entry_type` isn't declared in the
-          KB's `kb.yaml` types (and isn't a core type). Aggregated per
-          `(kb, type)` with a count. KBs without a `kb.yaml` are skipped
-          since there's no declared-type list to enforce.
+          KB's `kb.yaml` types, core types included. Aggregated per
+          `(kb, type)` with a count. KBs without a `kb.yaml`, or whose
+          `kb.yaml` declares no types, are skipped since there's no
+          declared-type list to enforce.
         - missing_required_fields: entries missing a field the type's
           `required:` list declares. One entry per (kb, id, type, missing).
           KBs without a `kb.yaml` are skipped.
@@ -1096,21 +1277,21 @@ class IndexManager:
         if rows:
             health["broken_links"] = rows[0]["cnt"]
 
-        # Entries using an undeclared `entry_type` — drift detector.
-        # For each KB that ships a kb.yaml, build the set of declared types
-        # (kb.yaml types + CORE_TYPES) and report any (kb, type, count) not
-        # in that set. KBs without a kb.yaml are skipped: we can't enforce
-        # what isn't configured.
-        from ..schema.core_types import CORE_TYPES
+        # Each kb.yaml is loaded once here, never again below: a schema that
+        # fails to load is reported in `schema_errors` and its KB counts as
+        # declaring no types, so health still answers for the broken KB.
+        schemas = self._load_schemas(kbs)
 
+        # The schema owns the type vocabulary; an empty declaration is
+        # unrestricted, including plugin types and core types.
         for kb in kbs:
             if not kb.path.exists() or not kb.kb_yaml_path.exists():
                 continue
 
-            declared: set[str] = set(CORE_TYPES.keys())
-            kb_schema = kb.kb_schema
-            if kb_schema and kb_schema.types:
-                declared.update(kb_schema.types.keys())
+            kb_schema = schemas[kb.name][0]
+            declared = set(kb_schema.declared_types()) if kb_schema else set()
+            if not declared:
+                continue
 
             type_rows = self.db.execute_sql(
                 "SELECT entry_type, COUNT(*) AS cnt FROM entry "
@@ -1124,13 +1305,15 @@ class IndexManager:
                         {"kb": kb.name, "type": etype, "count": row["cnt"]}
                     )
 
+        health.update(self._type_name_drift(kbs, schemas))
+
         # Required-field + subdirectory checks. Per KB with a kb.yaml,
         # compare each entry against its type's `required:` list (default
         # ["title"]) and its `subdirectory:` hint. Skip KBs with no kb.yaml.
         for kb in kbs:
             if not kb.path.exists() or not kb.kb_yaml_path.exists():
                 continue
-            kb_schema = kb.kb_schema
+            kb_schema = schemas[kb.name][0]
             if not kb_schema or not kb_schema.types:
                 continue
 
@@ -1202,9 +1385,86 @@ class IndexManager:
 
         for kb in kbs:
             if kb.path.exists():
-                self._check_off_list_values(kb, health, file_values, validators_for(kb))
+                self._check_off_list_values(
+                    kb, health, file_values, validators_for(kb), schemas[kb.name][0]
+                )
 
         return health
+
+    @staticmethod
+    def _load_schemas(kbs: Iterable[KBConfig]) -> dict[str, tuple[Any, str | None]]:
+        """Each KB's schema, loaded once: ``{kb: (schema or None, error or None)}``.
+
+        Health diagnoses broken KBs, so a kb.yaml that fails to load (invalid
+        YAML, `types: null`, `types: [a, b]`) gives ``(None, error)`` -- the KB
+        declares no types -- instead of raising. ``KBConfig.kb_schema`` does not
+        cache a failure, so every later read would raise again. A KB with no
+        kb.yaml gives ``(None, None)``.
+        """
+        loaded: dict[str, tuple[Any, str | None]] = {}
+        for kb in kbs:
+            if not kb.kb_yaml_path.exists():
+                loaded[kb.name] = (None, None)
+                continue
+            try:
+                loaded[kb.name] = (kb.kb_schema, None)
+            except Exception as exc:
+                loaded[kb.name] = (None, str(exc) or type(exc).__name__)
+        return loaded
+
+    def _type_name_drift(
+        self,
+        kbs: Iterable[KBConfig],
+        schemas: dict[str, tuple[Any, str | None]] | None = None,
+    ) -> dict[str, Any]:
+        """Report exact case/underscore/space variants, independently per KB.
+
+        Only the derived index is read; this does not normalize stored types.
+        JSON is bounded to 100 groups and 50 spellings per group, with totals.
+        ``schemas`` is ``_load_schemas(kbs)`` when the caller already loaded
+        them; ``schema_errors`` names each KB whose kb.yaml failed to load.
+        """
+        kbs = sorted(kbs, key=lambda item: item.name)
+        if schemas is None:
+            schemas = self._load_schemas(kbs)
+        groups = []
+        schema_errors = []
+        for kb in kbs:
+            schema, error = schemas[kb.name]
+            if error is not None:
+                schema_errors.append({"kb": kb.name, "error": error})
+            declared: set[str] = schema.declared_types() if schema is not None else set()
+            by_name: dict[str, list[dict[str, Any]]] = {}
+            rows = self.db.execute_sql(
+                "SELECT entry_type, COUNT(*) AS cnt FROM entry "
+                "WHERE kb_name = :kb_name GROUP BY entry_type ORDER BY entry_type",
+                {"kb_name": kb.name},
+            )
+            for row in rows:
+                spelling = row["entry_type"]
+                if not spelling:
+                    continue
+                normalized = spelling.lower().replace("_", "-").replace(" ", "-")
+                by_name.setdefault(normalized, []).append(
+                    {"type": spelling, "count": row["cnt"], "declared": spelling in declared}
+                )
+            for normalized, spellings in sorted(by_name.items()):
+                if len(spellings) > 1:
+                    groups.append(
+                        {
+                            "kb": kb.name,
+                            "normalized": normalized,
+                            "spellings": spellings[:50],
+                            "spellings_total": len(spellings),
+                            "spellings_has_more": len(spellings) > 50,
+                        }
+                    )
+        return {
+            "type_name_drift": groups[:100],
+            "type_name_drift_total": len(groups),
+            "type_name_drift_has_more": len(groups) > 100,
+            "schema_errors": schema_errors,
+        }
 
     #: Index columns that are never an enum-constrained field value.
     _NOT_FIELD_COLUMNS = frozenset(
@@ -1217,6 +1477,7 @@ class IndexManager:
         health: dict,
         file_values: dict[tuple[str, str], dict[str, Any]],
         validators: list,
+        kb_schema: Any = None,
     ) -> None:
         """Report every off-list value of a declared enum in ``kb`` (#555, #47).
 
@@ -1244,7 +1505,8 @@ class IndexManager:
         """
         from ..schema.enum_check import enum_findings
 
-        kb_schema = kb.kb_schema if kb.kb_yaml_path.exists() else None
+        # ``kb_schema`` is check_health's one load: None for no kb.yaml or one
+        # that failed to load (then only plugin validators apply).
         declares_enums = kb_schema is not None and (
             any(fs.allowed_values() for ts in kb_schema.types.values() for fs in ts.fields.values())
             or any(
@@ -1385,20 +1647,26 @@ class IndexManager:
         self,
         kb_name: str | None = None,
         progress_callback: Callable[[int, int], None] | None = None,
+        *,
+        verify: bool = False,
     ) -> dict[str, Any]:
         """Reconcile one KB, or every configured KB, reading only files whose
         stat moved and paths the index does not know (``reconcile_kb``).
 
-        Returns ``added``, ``updated``, ``removed``, ``malformed`` and
-        ``duplicates`` summed over the KBs. The CLI prints the malformed and
-        duplicate files as a summary rather than per-file tracebacks (Tier A
-        1080).
+        When verify=True, also hash known files whose stat is unchanged and re-read
+        those whose content hash differs.
+
+        Returns ``added``, ``updated``, ``removed``, ``malformed``,
+        ``skipped`` non-regular files and ``duplicates`` summed over the KBs.
+        The CLI prints malformed, skipped and duplicate files as a summary
+        rather than per-file tracebacks (Tier A 1080).
         """
         results: dict[str, Any] = {
             "added": 0,
             "updated": 0,
             "removed": 0,
             "malformed": [],
+            "skipped": [],
             "duplicates": [],
         }
         kbs = [self.config.get_kb(kb_name)] if kb_name else self.config.all_kbs()
@@ -1408,10 +1676,14 @@ class IndexManager:
             callback = None
             if progress_callback and len(kbs) == 1:
                 callback = progress_callback
-            one = self.reconcile_kb(kb, progress_callback=callback)
+            if verify:
+                one = self.reconcile_kb(kb, progress_callback=callback, verify=True)
+            else:
+                one = self.reconcile_kb(kb, progress_callback=callback)
             for key in ("added", "updated", "removed"):
                 results[key] += one[key]
             results["malformed"].extend(one["malformed"])
+            results["skipped"].extend(one["skipped"])
             results["duplicates"].extend(one["duplicates"])
             if progress_callback and len(kbs) > 1:
                 progress_callback(n, len(kbs))
@@ -1423,6 +1695,29 @@ class IndexManager:
         result = self.reconcile_kb(kb_config)
         result.pop("written", None)
         return result
+
+    def _drop_unservable_versions(
+        self,
+        entry_id: str,
+        kb_name: str,
+        kb_path: Path,
+        current_rel_path: str,
+        accepted: set[str],
+        git_service: Any,
+    ) -> None:
+        """Delete this entry's rows outside the walk on a positive fact only:
+        the read refuses a file git did read (another entry's id), or the
+        stored path is unsafe. `git_service` is the injected GitService:
+        storage does not import it. Anything else (git failed, the commit is
+        unreadable or past a shallow boundary) keeps the row (#453)."""
+        for commit_hash, stored_path in self.db.list_entry_version_rows(entry_id, kb_name):
+            if commit_hash in accepted:
+                continue
+            verdict, _ = git_service.version_servability(
+                kb_path, commit_hash, stored_path, current_rel_path, entry_id
+            )
+            if verdict == git_service.REFUSED:
+                self.db.delete_entry_version(entry_id, kb_name, commit_hash)
 
     def index_with_attribution(
         self,
@@ -1485,19 +1780,29 @@ class IndexManager:
             if not is_git:
                 return None
             rel_path = str(file_path.relative_to(kb_path))
-            log_entries = _same_entry_history(
-                entry.id,
-                rel_path,
-                git_service.get_file_log(kb_path, rel_path),
-                kb_path,
-                git_service,
-            )
+            walked = git_service.get_file_log(kb_path, rel_path)
+            log_entries = _same_entry_history(entry.id, rel_path, walked, kb_path, git_service)
             if log_entries:
                 # First commit = created_by, last commit = modified_by
                 data["created_by"] = log_entries[-1]["author_name"]
                 data["modified_by"] = log_entries[0]["author_name"]
 
             def write_versions() -> None:
+                # entry_version is derived from git, so a recompute removes
+                # what is stale, but only a row the version read would refuse
+                # (#453). Not "every row outside the walk": the walk misses
+                # renames git does not detect, and a row `record_commit` adds
+                # concurrently is servable, so a servability check (the
+                # read's own rule) spares both. An empty walk learned nothing.
+                if walked:
+                    self._drop_unservable_versions(
+                        entry.id,
+                        kb_name,
+                        kb_path,
+                        rel_path,
+                        {e["hash"] for e in log_entries},
+                        git_service,
+                    )
                 # After the row (entry_version's FK). Each commit's file_path
                 # is the KB-relative path this entry had *at that commit* (its
                 # own tree), not necessarily its current path -- get_file_log

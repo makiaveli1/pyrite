@@ -12,7 +12,7 @@ from typing import Any
 
 from ..config import PyriteConfig
 from ..storage.database import PyriteDB
-from .access_policy import UNSCOPED
+from .access_policy import UNSCOPED, named_kb
 from .search_service import build_or_query, clip_semantic_text
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,23 @@ class LinkDiscoveryService:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _require_kbs(self, *names: str | None) -> None:
+        """Refuse a KB name that matches no KB, before any read (#846).
+
+        Each public read here names its KBs, and without this answered an
+        empty result -- ``outcome: done``, exit 0 -- for a typo. ``None`` is
+        "not narrowed" (every KB), never a name. Called once per public
+        call; the per-entry ``discover_neighbors`` calls inside
+        ``batch_suggest`` and ``find_orphans`` repeat a dict lookup.
+
+        A blank name names no KB (``access_policy.named_kb``): it is not a
+        typo to refuse here but an id left unplaced, which the entry lookup
+        refuses as ``AMBIGUOUS`` when more than one KB holds it (#528).
+        """
+        for name in names:
+            if named_kb(name):
+                self.config.require_kb(name)
 
     @staticmethod
     def build_suggest_query(entry: dict) -> str:
@@ -57,6 +74,7 @@ class LinkDiscoveryService:
         Returns a list of candidate dicts with id, kb_name, title, entry_type,
         score, and snippet.
         """
+        self._require_kbs(kb_name, target_kb)
         from .kb_service import KBService
         from .search_service import SearchService
 
@@ -65,6 +83,11 @@ class LinkDiscoveryService:
         entry = svc.get_entry(entry_id, kb_name=kb_name, readable_kbs=UNSCOPED)
         if entry is None:
             return []
+        # The KB the entry was found in, whatever the caller wrote: a blank
+        # `kb_name` placed the id by lookup, and every comparison below
+        # (self, backlinks) must use that KB, not the blank (#912).
+        kb_name = entry.get("kb_name") or kb_name
+        target_kb = named_kb(target_kb)
 
         query = self.build_suggest_query(entry)
         if not query.strip():
@@ -91,7 +114,7 @@ class LinkDiscoveryService:
         candidates = []
         for r in raw_results:
             rid = r.get("id", "")
-            if rid == entry_id:
+            if rid == entry_id and r.get("kb_name", search_kb) == kb_name:
                 continue
             if rid in existing_targets:
                 continue
@@ -124,6 +147,7 @@ class LinkDiscoveryService:
         exclude_linked: bool = True,
         *,
         readable_kbs: set[str] | None,
+        include_empty: bool = False,
     ) -> list[dict]:
         """Find related entries in all KBs, including the source KB, unless narrowed.
 
@@ -135,7 +159,15 @@ class LinkDiscoveryService:
         `target_kb` omitted the search spans every KB, so a candidate from a
         KB outside that set is dropped here -- without it a caller who may
         read one KB is handed another KB's entry as a suggestion (#186).
+
+        Candidates with no body and no summary (blank after trimming
+        whitespace) are left out unless `include_empty` (#200). The
+        exclusion is a predicate in the search query, not a filter on its
+        result, so `limit` candidates come back when that many qualify. It
+        applies to candidates only: an empty source entry still gets
+        suggestions.
         """
+        self._require_kbs(kb_name, target_kb)
         from .kb_service import KBService
         from .search_service import SearchService
 
@@ -143,6 +175,8 @@ class LinkDiscoveryService:
         entry = svc.get_entry(entry_id, kb_name=kb_name, readable_kbs=readable_kbs)
         if entry is None:
             return []
+        kb_name = entry.get("kb_name") or kb_name  # see suggest_links
+        target_kb = named_kb(target_kb)
 
         # Build search query from entry content
         title = entry.get("title", "")
@@ -192,6 +226,7 @@ class LinkDiscoveryService:
             limit=limit + 30,
             mode=actual_mode,
             semantic_query=semantic_query or None,
+            non_empty=not include_empty,
         )
 
         # Collect existing link targets to exclude
@@ -217,8 +252,12 @@ class LinkDiscoveryService:
             if exclude_linked and rid in existing_targets:
                 continue
 
-            if "distance" in r:
-                score = round(1.0 - (r["distance"] / 2.0), 4)
+            if r.get("similarity") is not None:
+                # Cosine similarity, the same number on every backend (#668).
+                # This read `1 - distance / 2`, which is neither backend's
+                # cosine: `distance` is L2 on SQLite and cosine distance on
+                # Postgres.
+                score = r["similarity"]
             else:
                 score = round(r.get("rank", 0.0), 4)
 
@@ -250,12 +289,15 @@ class LinkDiscoveryService:
         exclude_linked: bool = True,
         *,
         readable_kbs: set[str] | None,
+        include_empty: bool = False,
     ) -> list[dict]:
         """Find all potential cross-KB links between two KBs.
 
         For each entry in source_kb, runs discover_neighbors against target_kb,
-        then deduplicates bidirectional matches and sorts by score.
+        then deduplicates bidirectional matches and sorts by score. Targets
+        with no body and no summary are left out unless `include_empty` (#200).
         """
+        self._require_kbs(source_kb, target_kb)
         from .kb_service import KBService
 
         svc = KBService(self.config, self.db)
@@ -274,6 +316,7 @@ class LinkDiscoveryService:
                 mode=mode,
                 exclude_linked=exclude_linked,
                 readable_kbs=readable_kbs,
+                include_empty=include_empty,
             )
 
             for c in candidates:
@@ -315,6 +358,7 @@ class LinkDiscoveryService:
         Orphan score = potential_matches - cross_kb_links. High score means
         "should be connected but isn't."
         """
+        self._require_kbs(kb_name)
         from .kb_service import KBService
 
         svc = KBService(self.config, self.db)
@@ -384,6 +428,7 @@ class LinkDiscoveryService:
         Returns links that exist in one direction (A\u2192B) but not the reverse (B\u2192A).
         When both names are the same, each directed link is considered once.
         """
+        self._require_kbs(kb_a, kb_b)
         if kb_a == kb_b:
             entries = self.db.list_entries(kb_name=kb_a, limit=10000)
             entry_ids = {entry["id"] for entry in entries}

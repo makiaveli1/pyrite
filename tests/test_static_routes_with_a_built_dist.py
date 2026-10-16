@@ -60,7 +60,11 @@ def test_mcp_info_is_404_not_the_spa_when_mcp_is_unmounted(stub_dist, monkeypatc
     monkeypatch.setattr(sdk_sse.SseServerTransport, "__init__", init_without_owners)
 
     with tempfile.TemporaryDirectory() as d:
-        os.environ.setdefault("PYRITE_DATA_DIR", d)
+        # monkeypatch, not os.environ: a direct setdefault keeps PYRITE_DATA_DIR
+        # set for later tests in the same xdist worker, and _apply_env_overrides
+        # then points their load_config() at this deleted temp dir's empty
+        # index.db (#896).
+        monkeypatch.setenv("PYRITE_DATA_DIR", d)
         with TestClient(create_app()) as client:
             for method, path in (("GET", "/mcp/info"), ("POST", "/mcp/messages/")):
                 resp = client.request(method, path)

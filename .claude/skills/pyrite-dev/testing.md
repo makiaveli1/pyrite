@@ -208,8 +208,8 @@ class TestValidators:
 # Extension tests
 .venv/bin/pytest extensions/my-extension/tests/ -v
 
-# All backend tests
-.venv/bin/pytest tests/ -v
+# All backend tests (the whole suite is a heavy run: take the lock)
+scripts/heavy_lock.py -- .venv/bin/pytest tests/ extensions/*/tests/ -n 4 -q
 
 # With print output visible
 .venv/bin/pytest tests/test_file.py -v -s --tb=long
@@ -235,35 +235,37 @@ npm run test:unit
 ### Frontend E2E (Playwright)
 
 ```bash
-cd web
-
-# All E2E
-npm run test:e2e
+# All E2E (npm run test:e2e in web/ is the same script)
+scripts/e2e.sh
 
 # Single spec
-npx playwright test e2e/file.spec.ts
+scripts/e2e.sh e2e/file.spec.ts
 
 # Headed (see the browser)
-npx playwright test --headed
+scripts/e2e.sh --headed
 
 # Debug mode (step through)
-npx playwright test --debug
+scripts/e2e.sh --debug
 ```
+
+`scripts/e2e.sh` runs `npx playwright test` in `web/` with your arguments,
+under the machine-wide heavy-run lock (`scripts/heavy_lock.py`, #168): one
+suite, verify-red or Playwright run at a time on the machine; a second waits
+and says who holds the lock. Local workers: `PW_WORKERS=N`, else Playwright's
+default (half the cores). It is not bounded lower yet: `e2e/seed.spec.ts`
+times out at 1-2 workers (#906); bound it once that is fixed.
 
 **Playwright config** starts both FastAPI (:8088) and Vite (:5173) dev servers. Uses `reuseExistingServer` in dev so you can keep servers running.
 
 ## Pre-Commit Hooks
 
-The `.pre-commit-config.yaml` runs:
+What each hook stage runs, and why: [CONTRIBUTING, "Branches, hooks and pull
+requests"](../../../CONTRIBUTING.md#branches-hooks-and-pull-requests).
 
-1. **ruff** — lint check
-2. **ruff-format** — auto-format
-3. **pytest** — runs in `.venv/`
-
-**Double-failure pattern:** If ruff-format reformats files, the first commit attempt fails. The reformatted files are unstaged. Re-stage and commit again:
+**Double-failure pattern:** If ruff-format reformats files, the first commit attempt fails. The reformatted files are unstaged. Re-stage those paths and commit again:
 
 ```bash
-git add -u && git commit -m "same message"
+git add <the files ruff-format changed> && git commit -m "same message"
 ```
 
-**Extension discovery:** pytest pre-commit uses `.venv/`. If your extension isn't `pip install -e` in the venv, its tests will fail with `ModuleNotFoundError: No module named 'pyrite_my_extension'`.
+**Extension discovery:** the tests run from `.venv/`. If your extension isn't `pip install -e` in the venv, its tests will fail with `ModuleNotFoundError: No module named 'pyrite_my_extension'`.

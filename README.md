@@ -55,15 +55,18 @@ pyrite mcp-setup                  # write tier; --tier read|admin, --client, --p
 ```
 
 `pyrite mcp-setup` points a `pyrite` server entry at this install where each
-client reads it: `claude mcp add` for Claude Code (or `./.mcp.json` with
-`--project`), and Claude Desktop's own `claude_desktop_config.json`. Run it
+client reads it: `claude mcp add -s user` for Claude Code (or `./.mcp.json`
+with `--project`), and Claude Desktop's own `claude_desktop_config.json`. Run it
 again any time. An entry that already points here is not rewritten; one that
 points elsewhere gets its command path changed (and its tier, if you pass
 `--tier`), and keeps its `env`, extra arguments and other keys. Other servers
 are never touched. Each client is all or nothing: one it cannot change safely
 is left as it was with the reason, while another may still be changed, and
 the exit code is 1 unless every client ended up pointing here. The JSON report
-names each client and what changed.
+names each client and what changed, says what the file holds when a change
+could not be finished, and names a `pyrite` entry in another Claude Code scope
+(one project's, from `claude mcp add` without `-s user`) that would be used
+instead of this one.
 [Getting started](docs/getting-started.md#connect-an-ai-via-mcp) lists the
 cases.
 
@@ -111,7 +114,7 @@ Pagination and totals differ by tool and by transport (CLI/MCP/REST) — see `do
 
 Plugins add their own tools per tier (e.g., software-kb adds `sw_adrs`, `sw_backlog`, `sw_new_adr`).
 
-Also exposes: 4 prompts (`research_topic`, `summarize_entry`, `find_connections`, `daily_briefing`), resources (`pyrite://kbs`, `pyrite://kbs/{name}/entries`, `pyrite://entries/{id}`).
+Also exposes: 4 prompts (`research_topic`, `summarize_entry`, `find_connections`, `daily_briefing`), resources (`pyrite://kbs`, `pyrite://kbs/{name}/entries`, `pyrite://entries/{id}`, `pyrite://kbs/{name}/entries/{id}`).
 
 Use `pyrite mcp --tier read` for a read-only server.
 
@@ -212,13 +215,18 @@ Six extensions ship:
 | **zettelkasten** *(example plugin)* | CEQRC maturity workflow | Notes with maturity progression |
 | **encyclopedia** *(example plugin)* | Articles with review workflow | Articles, reviews, voting |
 | **social** *(example plugin)* | Engagement tracking | Social interactions |
-| **journalism-investigation** | Investigative research | Sources, claims, actors, evidence chains |
+| **journalism-investigation** *(experimental; unsupported)* | Investigative research | Sources, claims, actors, evidence chains |
 | **cascade** | Timeline research | Timeline events, actors, capture lanes |
 
 `zettelkasten`, `encyclopedia` and `social` are example plugins: reference
 code showing how a Pyrite plugin adds entry types, CLI commands, MCP tools
 and a preset, not supported products. See each extension's `README.md` for
 what it demonstrates.
+
+**EXPERIMENTAL: Unsupported until the 0.28 alpha plugin/API contract.**
+The journalism-investigation MCP tools are not a supported product surface.
+
+Tracked issues: [#92](https://github.com/pyrite-wiki/pyrite/issues/92), [#93](https://github.com/pyrite-wiki/pyrite/issues/93), [#94](https://github.com/pyrite-wiki/pyrite/issues/94), and [#98](https://github.com/pyrite-wiki/pyrite/issues/98).
 
 ## Web UI
 
@@ -342,7 +350,7 @@ cd web && npm ci && npm run build && cd ..   # the web UI (optional)
 Or straight from a release tag, no clone:
 
 ```bash
-pip install "pyrite[server,cli] @ git+https://github.com/pyrite-wiki/pyrite@v0.25.6"
+pip install "pyrite[server,cli] @ git+https://github.com/pyrite-wiki/pyrite@v0.25.8"
 ```
 
 That gives you the CLI, the REST API and the MCP server, but **not the web
@@ -381,8 +389,8 @@ pip install -e ".[all]"
 for ext in extensions/*/; do pip install -e "$ext"; done
 pre-commit install
 
-# Tests (core and extensions; in parallel with -n auto)
-pytest tests/ extensions/ -n auto
+# Tests (core and extensions; -n 4, not -n auto, and through the heavy-run lock)
+scripts/heavy_lock.py -- pytest tests/ extensions/ -n 4
 
 # Frontend
 cd web && npm install && npm run dev
@@ -405,11 +413,12 @@ pyrite sw standards      # Coding conventions
 ## Documentation
 
 - [Getting Started](docs/getting-started.md) — install, create a KB, connect an AI
+- [Pyrite in 20 minutes](docs/tutorials/pyrite-in-20-minutes.md) — a hands-on first tutorial
 - [Configuration](docs/configuration.md) — `config.yaml` and every `PYRITE_*` environment variable
-- [Plugin Writing Tutorial](docs/tutorials/plugin-writing.md) — build a custom plugin step by step
+- [JSON contracts](docs/json-contracts.md) — result and error shapes for agent integrators
 - [Plugins Directory](docs/plugins.md) — official and community plugins
-- [OpenAI / Codex MCP Integration](docs/openai-mcp-integration.md)
-- [Gemini CLI MCP Integration](docs/gemini-mcp-integration.md)
+
+[All documentation](docs/README.md) — pages grouped by reader and task
 
 ## Background
 

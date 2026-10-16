@@ -44,6 +44,33 @@ def test_ascii_ids_are_unchanged():
     assert generate_entry_id("Use A/B testing: now, or later?") == "use-a-b-testing-now-or-later"
 
 
+def test_non_string_yaml_scalar_titles_are_stringified_before_slugging():
+    # #704: `title: 1e3` / `title: 2024` / `title: true` load as non-strings.
+    assert generate_entry_id(2024) == "2024"
+    assert generate_entry_id(1000.0) == "1000-0"
+    assert generate_entry_id(True) == "true"
+    # falsy scalars keep the empty-title id they had before #704: no id moves
+    assert generate_entry_id(False) == generate_entry_id("") == "entry-da39a3ee"
+    assert generate_entry_id(0) == generate_entry_id(0.0) == "entry-da39a3ee"
+    assert generate_entry_id(None).startswith("entry-")
+    for value in (2024, 1000.0, True, False, 0):
+        assert SAFE.match(generate_entry_id(value)), repr(value)
+
+
+@pytest.mark.control(
+    reason="dev already skips these files via the same TypeError; pins the refusal"
+)
+def test_titles_that_cannot_be_indexed_get_no_id():
+    # #762 review item 2: a sequence, mapping or NaN title must stay out of id
+    # derivation with a named reason, so `ids pin` never writes an id into a
+    # file Pyrite cannot index (list titles are #711).
+    import math
+
+    for value in (["a", "b"], (1, 2), {"a": 1}, math.nan):
+        with pytest.raises(TypeError):
+            generate_entry_id(value)
+
+
 def test_accents_transliterate_instead_of_vanishing():
     assert generate_entry_id("Café résumé naïve") == "cafe-resume-naive"
 

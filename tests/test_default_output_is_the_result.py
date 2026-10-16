@@ -282,7 +282,7 @@ class TestSemanticWithoutTheExtraSaysSo:
         warnings: list[str] = []
         assert _search(indexed[1], "semantic", warnings) == []
         assert len(warnings) == 1
-        assert "pip install pyrite[semantic]" in warnings[0]
+        assert "pip install" in warnings[0] and "[semantic]" in warnings[0]
         assert "keyword leg ran" not in warnings[0], "false in pure semantic mode"
 
     def test_hybrid_names_the_install_line_beside_real_keyword_hits(self, indexed, no_extra):
@@ -290,7 +290,7 @@ class TestSemanticWithoutTheExtraSaysSo:
         results = _search(indexed[1], "hybrid", warnings)
         assert [r["id"] for r in results] == ["kestrel"]
         assert len(warnings) == 1
-        assert "pip install pyrite[semantic]" in warnings[0]
+        assert "pip install" in warnings[0] and "[semantic]" in warnings[0]
         assert "only the keyword leg ran" in warnings[0]
 
     def test_an_extension_that_will_not_load_does_not_get_the_install_line(
@@ -373,7 +373,7 @@ class TestSemanticWithoutTheExtraSaysSo:
             .get("/api/search", params={"q": "falcon", "kb": "t", "mode": "semantic"})
             .json()
         )
-        assert any("pip install pyrite[semantic]" in w for w in body["warnings"]), body
+        assert any("pip install" in w and "[semantic]" in w for w in body["warnings"]), body
 
     def test_the_warning_reaches_mcp(self, indexed, no_extra):
         from pyrite.server.mcp_server import PyriteMCPServer
@@ -386,7 +386,7 @@ class TestSemanticWithoutTheExtraSaysSo:
             )
         finally:
             server.close()
-        assert any("pip install pyrite[semantic]" in w for w in result["warnings"]), result
+        assert any("pip install" in w and "[semantic]" in w for w in result["warnings"]), result
 
     def test_the_warning_reaches_the_cli_on_stderr_and_stdout_stays_one_document(self, tmp_path):
         kb = tmp_path / "kb"
@@ -410,7 +410,7 @@ class TestSemanticWithoutTheExtraSaysSo:
             pre=pre,
         )
         assert proc.returncode == 0, proc.stderr
-        assert "pip install pyrite[semantic]" in proc.stderr
+        assert "pip install" in proc.stderr and "[semantic]" in proc.stderr
         json.loads(proc.stdout)
 
 
@@ -515,12 +515,11 @@ class TestIndexEmbedReportsTheVectorsItAdded:
         result = CliRunner().invoke(app, ["index", "embed", "--force"])
         assert "Embedded: 2" in result.output, result.output
 
-    @pytest.mark.control(
-        reason="dev exited 0 with Errors named; pins that exit codes are unchanged here (0.25.8 owns them)"
-    )
-    def test_model_unreachable_still_exits_zero_with_errors_named(self, tmp_path, monkeypatch):
-        """Regime: model unreachable. Exit codes are 0.25.8's contract and
-        scripts/release.py asserts exit 0 here, so this pins the *report* only."""
+    def test_model_unreachable_names_the_errors_and_exits_one(self, tmp_path, monkeypatch):
+        """Regime: model unreachable. The report names the errors, and the exit
+        is 1 (#526): none was embedded, and they stay owed (3 when some were). docs/getting-started.md's
+        embed step accepts 0 or 1, which is what keeps the offline tutorial and the
+        release check (scripts/release.py step c) green."""
         from typer.testing import CliRunner
 
         from pyrite.cli import app
@@ -537,7 +536,7 @@ class TestIndexEmbedReportsTheVectorsItAdded:
             lambda self: MagicMock(**{"embed_entry.side_effect": offline}),
         )
         result = CliRunner().invoke(app, ["index", "embed"])
-        assert result.exit_code == 0, result.output
+        assert result.exit_code == 1, result.output
         assert "Embedded: 0" in result.output
         assert "Errors: 2" in result.output, result.output
         assert _vector_count(db) == 0

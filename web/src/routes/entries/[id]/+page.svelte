@@ -14,11 +14,12 @@
 	import { uiStore } from '$lib/stores/ui.svelte';
 	import { authStore } from '$lib/stores/auth.svelte';
 	import { brandStore } from '$lib/stores/brand.svelte';
+	import AmbiguousEntry from '$lib/components/entry/AmbiguousEntry.svelte';
 	import { buildEntrySeo } from '$lib/utils/seo';
 	import { jsonForScriptTag } from '$lib/utils/sanitize';
-	import { api } from '$lib/api/client';
+	import { api, ApiError } from '$lib/api/client';
 	import { page } from '$app/stores';
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
 	import { parseWikilinks } from '$lib/editor/wikilink-utils';
 	import SkeletonLoader from '$lib/components/common/SkeletonLoader.svelte';
 
@@ -31,9 +32,21 @@
 	let resolvedIds = $state<Set<string>>(new Set());
 
 	const entryId = $derived($page.params.id as string);
+	const entryKb = $derived($page.url.searchParams.get('kb') || undefined);
+
+	// The layout remounts the page only when the pathname changes, so
+	// /entries/dup -> /entries/dup?kb=a (the chooser's links) and a -> b
+	// reuse it: load again whenever the id or the KB changes (#912).
+	$effect(() => {
+		const id = entryId;
+		const kb = entryKb;
+		untrack(() => {
+			editing = false;
+			entryStore.loadEntry(id, kb);
+		});
+	});
 
 	onMount(() => {
-		entryStore.loadEntry(entryId);
 
 		function handleKeydown(e: KeyboardEvent) {
 			if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key === 'B') {
@@ -96,13 +109,14 @@
 				const target = (placeholder as HTMLElement).dataset.transclusionTarget;
 				if (!target) continue;
 
+				const targetKb = (placeholder as HTMLElement).dataset.transclusionKb || undefined;
 				const heading = (placeholder as HTMLElement).dataset.transclusionHeading || undefined;
 				const blockId = (placeholder as HTMLElement).dataset.transclusionBlock || undefined;
 				const loadingEl = placeholder.querySelector('.transclusion-loading');
 				if (!loadingEl) continue;
 
 				try {
-					const res = await api.resolveEntry(target);
+					const res = await api.resolveEntry(target, targetKb);
 					if (!res.resolved || !res.entry) {
 						loadingEl.textContent = 'Entry not found';
 						(loadingEl as HTMLElement).style.color = '#9ca3af';
@@ -131,8 +145,11 @@
 						loadingEl.textContent = 'No content';
 						(loadingEl as HTMLElement).style.color = '#9ca3af';
 					}
-				} catch {
-					loadingEl.textContent = 'Failed to load';
+				} catch (e) {
+					loadingEl.textContent =
+						e instanceof ApiError && e.code === 'AMBIGUOUS' && e.candidateKbs
+							? `"${target}" exists in ${e.candidateKbs.join(', ')}: write [[kb:${target}]]`
+							: 'Failed to load';
 					(loadingEl as HTMLElement).style.color = '#ef4444';
 				}
 			}
@@ -230,6 +247,8 @@
 				<SkeletonLoader lines={4} header />
 			</aside>
 		</div>
+	{:else if entryStore.ambiguousKbs}
+		<AmbiguousEntry {entryId} kbs={entryStore.ambiguousKbs} />
 	{:else if entryStore.error}
 		<div class="flex flex-1 items-center justify-center text-red-500">{entryStore.error}</div>
 	{:else if entryStore.current}

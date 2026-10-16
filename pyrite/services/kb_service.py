@@ -10,7 +10,7 @@ import copy
 import dataclasses
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 from ..config import KBConfig, PyriteConfig
 from ..exceptions import (
+    AmbiguousEntryError,
     EntryExistsError,
     EntryNotFoundError,
     IndexSyncRecoveryHintError,
@@ -31,15 +32,18 @@ from ..exceptions import (
     SchemaViolationError,
     UndeclaredTypeError,
     ValidationError,
+    public_text,
 )
 from ..models import Entry
 from ..models.base import parse_datetime
+from ..models.core_types import id_text
 from ..models.factory import build_entry
 from ..plugins.context import PluginContext
+from ..schema import Link, Source
 from ..schema.enum_check import is_off_list, is_per_element
 from ..storage.database import PyriteDB
 from ..storage.document_manager import DocumentManager
-from ..storage.index import IndexManager
+from ..storage.index import IndexManager, content_hash
 from ..storage.repository import KBRepository
 from ..utils.frontmatter import Frontmatter, NoFrontmatter, describe, split_frontmatter
 from ..utils.metadata import parse_metadata
@@ -118,6 +122,127 @@ def _norm_relation(relation: str) -> str:
     return _DEFAULT_RELATION if relation == _LEGACY_DEFAULT_RELATION else relation
 
 
+#: What one link of a file's `links:` must hold for the index insert to store
+#: it, field by field of the mapping ``Link.to_dict()`` hands to
+#: ``_sync_links`` (``pyrite/storage/backends/sqlite_backend.py``). A field is
+#: refused when it is null where the column is NOT NULL, or when it is a list
+#: or mapping -- unhashable in the row's key ``(target, kb, relation)``, or a
+#: value SQLite cannot bind (``note``). ``note`` and ``kb`` reach the insert
+#: only when truthy (``to_dict`` drops them otherwise), so a null or empty one
+#: is stored as the default. Anything else is a scalar SQLite stores as the
+#: file spells it, read back as text (``true`` becomes ``'1'``).
+_LINK_INSERT_RULES: dict[str, bool] = {
+    # field: refuse when null?
+    "target": True,  # target_id NOT NULL; part of the key
+    "relation": True,  # relation NOT NULL; part of the key
+    "note": False,  # dropped when falsy; bound as a value
+    "kb": False,  # dropped when falsy (defaults to the source KB); part of the key
+}
+
+
+def check_link_target(link: dict[str, Any]) -> None:
+    """Refuse a file's link exactly when the index insert cannot store it (#846).
+
+    The rule for links that arrive in a file or a frontmatter mapping
+    (``add``, a create's own ``links`` field, ``import``, MCP
+    ``kb_bulk_create``): ``link`` is ``Link.to_dict()``, what ``_sync_links``
+    receives, and it is refused for a null ``target`` or ``relation`` or a
+    list or mapping in any field (``_LINK_INSERT_RULES``). That is exactly the
+    set ``index sync`` reports as malformed, so ``add``, ``index sync`` and
+    ``update`` give one file one answer (principle 2; fix round 2). A blank
+    target or relation, a number, a boolean or a date is accepted and the
+    file is not rewritten. Before this, such a link was written and then the
+    index insert failed, after the file was on disk.
+    """
+    for key, refuse_null in _LINK_INSERT_RULES.items():
+        if key not in link:
+            continue
+        value = link[key]
+        if value is None and refuse_null:
+            raise ValidationError(f"A link's {key} is empty (null); the index cannot store it.")
+        if isinstance(value, list | tuple | set | dict):
+            raise ValidationError(
+                f"A link's {key} is a {type(value).__name__}, not a single value; "
+                "the index cannot store it."
+            )
+
+
+def _shown(value: Any) -> str:
+    """A non-text target as the caller likely typed it, and what YAML made of it."""
+    import datetime as _dt
+
+    if isinstance(value, bool):
+        return (
+            f"{value!r} (YAML reads yes/no/on/off/true/false as a boolean; "
+            f'quote it, e.g. target: "yes")'
+        )
+    if isinstance(value, int | float):
+        # Not echoed back as the example: YAML read `010` as 8, so "8" would
+        # be the wrong id. The caller knows what they typed.
+        return (
+            f"{value!r} (a number; YAML reads 010 as 8 and 1e3 as 1000.0; "
+            'quote the value as you wrote it, e.g. target: "2024")'
+        )
+    if isinstance(value, _dt.date):
+        return f'{value.isoformat()} (a date; quote it, e.g. target: "{value.isoformat()}")'
+    return repr(value)
+
+
+def check_link_spec(
+    target: Any,
+    relation: Any = None,
+    *,
+    note: Any = None,
+    target_kb: Any = None,
+) -> tuple[str, str, str]:
+    """The check a link the caller is creating passes before anything is written (#846).
+
+    For the explicit link-creation surfaces only: ``add_link`` (CLI ``link``,
+    MCP ``kb_link``), ``add_links`` (``links bulk-create``) and ``pyrite
+    create --link``, which calls it for every spec before it creates the
+    entry. There the caller typed the link, so it must say what it means:
+    the target must be non-blank text -- a number, boolean or date (what
+    YAML or JSON made of an unquoted value: ``yes`` is true, ``010`` is 8) is
+    refused with a hint to quote it, never converted, since converting
+    silently changes what was typed. A relation that is given must be
+    non-blank text; a note and a ``target_kb`` must be text.
+
+    Returns ``(target, relation, note)`` as they will be written: a relation
+    left out (``None``) is ``related_to``, a note left out is ``""``.
+
+    Never on read, and never on a file's own links: those get
+    :func:`check_link_target`, which refuses only what the index cannot store
+    (``kb/design.md``, principle 2). A ``:`` in a relation is accepted: it is
+    ambiguous only in the CLI's ``--link target:relation`` syntax, whose
+    parser refuses a third part.
+    """
+    if target is None or (isinstance(target, str) and not target.strip()):
+        raise ValidationError(f"A link needs a target entry id; got {target!r}.")
+    if not isinstance(target, str):
+        raise ValidationError(f"A link target must be text; got {_shown(target)}.")
+    if relation is None:
+        relation = _DEFAULT_RELATION
+    elif not isinstance(relation, str) or not relation.strip():
+        raise ValidationError(
+            f"A link's relation must be non-empty text; got {relation!r}. "
+            f"Leave it out for {_DEFAULT_RELATION}.",
+        )
+    if note is None:
+        note = ""
+    elif not isinstance(note, str):
+        raise ValidationError(f"A link's note must be text; got {type(note).__name__}.")
+    if target_kb is not None and not isinstance(target_kb, str):
+        raise ValidationError(f"A link's target_kb must be a KB name; got {target_kb!r}.")
+    return target, relation, note
+
+
+def _same_target(existing: Any, target: str) -> bool:
+    """The duplicate key's target comparison: as text, so a hand file's
+    ``target: 2024`` (an int) and a typed ``"2024"`` are one link, as they are
+    one row in the index (fix round 2)."""
+    return str(existing) == str(target)
+
+
 @dataclass
 class WriteResult:
     """What a write produced: the saved entry and the schema warnings it drew.
@@ -155,11 +280,7 @@ def _safe_message(exc: Exception) -> str:
     this too, rather than ``str(exc)`` directly. Logs the real detail
     server-side when it masks it.
     """
-    public_message = getattr(exc, "public_message", None)
-    if public_message is not None:
-        logger.warning("%s", exc)
-        return public_message
-    return str(exc)
+    return public_text(exc, log=logger)
 
 
 def _refusal_result(exc: Exception) -> dict[str, Any]:
@@ -398,7 +519,9 @@ class KBService:
         try:
             from .embedding_worker import EmbeddingWorker
 
-            self._embedding_worker = EmbeddingWorker(self.db)
+            self._embedding_worker = EmbeddingWorker(
+                self.db, model_name=self.config.settings.embedding_model
+            )
         except Exception:
             # A DB that cannot hold the queue (read-only, locked, out of disk)
             # must not fail the write: the entry is on disk and in the index
@@ -538,7 +661,7 @@ class KBService:
         """
         Get entry by ID, with its outlinks and backlinks.
 
-        If kb_name not specified, searches all KBs in config order.
+        If kb_name is omitted, searches readable KBs and refuses duplicate IDs.
 
         ``readable_kbs`` is the caller's ``ReadScope`` set (``None``:
         unscoped). With it, a lookup without a KB walks only readable KBs,
@@ -547,25 +670,149 @@ class KBService:
         computed over readable KBs only (P-R4). A named KB the caller
         cannot read is the caller's to refuse; here it reads as a miss. A
         blank ``kb_name`` names no KB (``access_policy.named_kb``).
+
+        The entry is read from its file as it is now (``_read_entry``), so
+        every surface that calls this -- CLI ``get``, ``pyrite-read get``,
+        REST ``GET /api/entries/{id}``, MCP ``kb_get`` and ``kb_read_body``
+        -- returns a hand edit before the next sync (#753). Without a KB,
+        readable KBs are tried in config order, ids the index knows first.
+        A read the index can answer (its row's file still holds the id) opens
+        that one file and walks no directory; only a miss looks for files by
+        name (``_entry_file``).
         """
         kb_name = named_kb(kb_name)
         if kb_name:
+            kb_name = self.config.kb_name_for(kb_name)  # a shortname names its KB
             if readable_kbs is not None and kb_name not in readable_kbs:
                 return None
-            result = self.db.get_entry(entry_id, kb_name)
+            result = self._read_entry(entry_id, kb_name)
             if result:
                 self._attach_links(result, entry_id, kb_name, readable_kbs)
             return result
 
-        # Search all KBs the caller can read
-        for kb in self.config.all_kbs():
-            if readable_kbs is not None and kb.name not in readable_kbs:
-                continue
-            result = self.db.get_entry(entry_id, kb.name)
-            if result:
-                self._attach_links(result, entry_id, kb.name, readable_kbs)
+        # Search all KBs the caller can read. An id the index knows in more
+        # than one of them is refused (#528), never answered by config order;
+        # only KBs in ``readable`` are counted, so a KB the caller cannot read
+        # never becomes a candidate (concealment, ADR-0037 section 4).
+        #
+        # KNOWN EXCEPTION to "never resolved silently": the by-name pass for
+        # unindexed files runs only when no readable KB's index knows the id
+        # (#857's cost bound). So an id indexed in one KB, with a
+        # not-yet-indexed <id>.md in another, is answered from the indexed KB
+        # (as #753 reads it); `pyrite index sync` removes the exception.
+        readable = [
+            kb.name
+            for kb in self.config.all_kbs()
+            if readable_kbs is None or kb.name in readable_kbs
+        ]
+        for unindexed in (False, True):
+            matches: list[tuple[str, dict[str, Any]]] = []
+            for name in readable:
+                result = self._read_entry(entry_id, name, unindexed=unindexed)
+                if result:
+                    matches.append((name, result))
+            if len(matches) > 1:
+                raise AmbiguousEntryError(entry_id, [name for name, _ in matches])
+            if matches:
+                name, result = matches[0]
+                self._attach_links(result, entry_id, name, readable_kbs)
                 return result
         return None
+
+    def _read_entry(
+        self, entry_id: str, kb_name: str, *, unindexed: bool | None = None
+    ) -> dict[str, Any] | None:
+        """THE single-entry read: the entry's file, parsed now (ADR-0042 decision 9).
+
+        The index row only says where to look. Its file is read if it still
+        holds the id (ADR-0038 I8); otherwise, and when there is no row, the
+        files named ``<id>.md`` in the KB are tried, each verified. No file
+        holding the id is a miss (``None``) even when a row remains: the file
+        decides (principle 5). A miss reads no file's content, because the
+        whole-KB scan ``find_file`` falls back to costs seconds on a large KB
+        (#135); a file whose id is not its name is found once it is indexed.
+
+        A row whose path lies outside the KB root is a user's worktree file
+        (the overlay read service, ``WorktreeResolver.get_read_service``): it
+        is read where it points and never replaced by a file in main.
+
+        A row with no ``file_path`` (rows the experimental journalism tools
+        create, #92) is returned as it is, with ``content_hash: None``.
+
+        ``unindexed``: None reads either way; False only ids with a row; True
+        only ids without one (``get_entry``'s two passes without a KB).
+
+        Lists, search and batch reads stay index reads and may lag.
+        """
+        row = self.db.get_entry(entry_id, kb_name)
+        if unindexed is not None and unindexed != (row is None):
+            return None
+        kb_config = self.get_kb(kb_name)
+        if row is not None and (not row.get("file_path") or kb_config is None):
+            row["content_hash"] = None  # no file to read: the row, as before
+            return row
+        if kb_config is None:
+            return None
+        found = self._entry_file(kb_config, entry_id, row)
+        if found is None:
+            return None
+        path, digest, entry = found
+        return self._index_mgr.read_fields(entry, kb_name, path, content_hash=digest, row=row)
+
+    def _entry_file(
+        self, kb_config: KBConfig, entry_id: str, row: dict[str, Any] | None
+    ) -> tuple[Path, str, Entry] | None:
+        """``(path, content_hash, entry)`` of the file holding ``entry_id``, or None."""
+        repo = KBRepository(kb_config)
+        indexed = Path(row["file_path"]) if row else None
+
+        def candidates() -> Iterator[Path]:
+            # Lazy: the indexed file is tried first, and the KB's directories
+            # are walked (``_filename_candidates`` runs ``rglob``) only when it
+            # does not hold the id. A hit never walks a directory.
+            if indexed is not None:
+                yield indexed
+            if indexed is not None and not repo._lexically_inside(indexed):
+                return  # an overlay row: never main's file in its place
+            # find_file's first step, without its whole-KB tail (see _read_entry).
+            try:
+                repo._validate_entry_id(entry_id)
+            except ValidationError:
+                return
+            for c in repo._filename_candidates(entry_id):
+                if c != indexed and repo._lexically_inside(c):
+                    yield c
+
+        unreadable: tuple[Path, Exception] | None = None
+        tried: set[Path] = set()
+        for path in candidates():
+            if path in tried:
+                continue
+            tried.add(path)
+            try:
+                raw = path.read_bytes()
+            except OSError:
+                continue
+            try:
+                # One read: the entry is parsed from the bytes that are hashed.
+                entry = repo.load_entry_from_bytes(path, raw)
+            except Exception as exc:
+                unreadable = unreadable or (path, exc)
+                continue
+            if id_text(entry.id) == entry_id:
+                return path, content_hash(raw), entry
+        if unreadable is not None:
+            self._unreadable_entry_file(kb_config.name, entry_id, *unreadable)
+        return None
+
+    @staticmethod
+    def _unreadable_entry_file(kb_name: str, entry_id: str, path: Path, exc: Exception) -> None:
+        """The file that may hold ``entry_id`` cannot be parsed.
+
+        A miss for now, with one log line and never a traceback. #777 gives
+        this its own error (``MALFORMED_ENTRY``): raise it here.
+        """
+        logger.warning("get %s/%s: cannot parse %s: %s", kb_name, entry_id, path, exc)
 
     def _attach_links(
         self,
@@ -645,7 +892,10 @@ class KBService:
     # =========================================================================
 
     def _writable_kb(self, kb_name: str) -> KBConfig:
-        kb_config = self.config.get_kb(kb_name)
+        # get_kb, not config.get_kb: the registry-aware lookup reads use, so a
+        # KB registered after this process started is writable wherever it is
+        # readable (#764 review), not KB_NOT_FOUND to create/update alone.
+        kb_config = self.get_kb(kb_name)
         if not kb_config:
             raise KBNotFoundError(f"KB not found: {kb_name}")
         if kb_config.read_only:
@@ -755,6 +1005,20 @@ class KBService:
         errors = entry.validate()
         if errors:
             raise ValidationError("; ".join(errors))
+        # A new entry's own links (a file given to `add`, a create's `links`
+        # field, an import) are ingest, not a link the caller is typing: only
+        # what the index insert cannot store is refused (check_link_target) --
+        # such a link used to be written, then fail the insert (#846). Nothing
+        # else, so the
+        # file that `update` and `index sync` accept, `add` accepts
+        # (principle 2). The target is not rewritten: `target: 2024` stays an
+        # int in the file. Not in `_validate_write`, which an update also
+        # runs: a link already in a hand-edited file is not the update's.
+        for link in entry.links:
+            try:
+                check_link_target(link.to_dict())
+            except ValidationError as e:
+                raise ValidationError(f"links: {e}") from None
         warnings = self._validate_write(entry, kb_name, kb_config)
 
         # Create never replaces. Ids are derived from titles, so two entries
@@ -1149,7 +1413,11 @@ class KBService:
         each written as sent; the CLI's ``-f`` never passes through here.
         """
         updatable = self.updatable_fields(entry_id, kb_name)
-        row = self.db.get_entry(entry_id, kb_name)
+        # The reading an echo is compared with is the read a get returns -- the
+        # file now -- not the row, which may lag it: a value the read
+        # normalised is then "unchanged" and not written over the file's own
+        # spelling (#753).
+        row = self._read_entry(entry_id, kb_name)
         entry_type = row.get("entry_type") if row else None
         managed = (
             self._field_sets(entry_type, self.config.get_kb(kb_name))[2]
@@ -1560,10 +1828,15 @@ class KBService:
             identical -- round-2 cold read: a confirmation naming the
             caller's relation instead of the file's would mislead a caller
             who then greps the file for what they typed). The duplicate key
-            is ``(target, kb, relation)``: a second, different relation
-            between the same two entries is a new link, not a duplicate
-            (#396).
+            is ``(target, kb, relation)``, with targets compared as text: a
+            second, different relation between the same two entries is a new
+            link, not a duplicate (#396).
         """
+        # A malformed request is refused before anything is loaded or written
+        # (#846); every link writer passes through this one check.
+        target_id, relation, note = check_link_spec(
+            target_id, relation, note=note, target_kb=target_kb
+        )
         kb_config = self.config.get_kb(source_kb)
         if not kb_config:
             raise KBNotFoundError(f"KB not found: {source_kb}")
@@ -1604,7 +1877,7 @@ class KBService:
         # earlier pass wrote correctly.
         for existing in entry.links:
             if (
-                existing.target == target_id
+                _same_target(existing.target, target_id)
                 and (existing.kb or source_kb) == tkb
                 and _norm_relation(existing.relation) == _norm_relation(relation)
             ):
@@ -1649,8 +1922,12 @@ class KBService:
         second copy of any entry kept elsewhere (#375).
 
         Returns one result per spec, in input order:
-        ``{"status": "created" | "skipped" | "failed", "error"?: str}``.
-        ``dry_run`` reports what would happen without writing.
+        ``{"status": "created" | "skipped" | "failed", "error"?: str,
+        "error_code"?: str}``. A spec that is malformed (not a mapping, no
+        source, a target or relation :func:`check_link_spec` refuses) or names
+        a ``target_kb`` that does not exist is ``failed`` before its source is
+        touched, with the code that refusal carries; the other specs go on
+        (#846). ``dry_run`` reports what would happen without writing.
         """
         kb_config = self._writable_kb(kb_name)
         repo = KBRepository(kb_config)
@@ -1660,10 +1937,11 @@ class KBService:
         dirty: dict[str, list[int]] = {}
 
         for i, spec in enumerate(links):
-            source_id = spec.get("source")
-            target_id = spec.get("target")
-            tkb = spec.get("target_kb") or kb_name
-            relation = spec.get("relation") or "related_to"
+            try:
+                source_id, target_id, relation, note, tkb = self._checked_bulk_spec(spec, kb_name)
+            except (ValidationError, KBNotFoundError) as e:
+                results[i] = {"status": "failed", "error": str(e), "error_code": e.error_code}
+                continue
             if source_id not in loaded:
                 loaded[source_id] = repo.load(source_id)
             entry = loaded[source_id]
@@ -1674,19 +1952,14 @@ class KBService:
             # normalised the same way so legacy data (no `relation:` key,
             # loaded as "related") matches this method's "related_to" default.
             if any(
-                existing.target == target_id
+                _same_target(existing.target, target_id)
                 and (existing.kb or kb_name) == tkb
                 and _norm_relation(existing.relation) == _norm_relation(relation)
                 for existing in entry.links
             ):
                 results[i] = {"status": "skipped"}
                 continue
-            entry.add_link(
-                target=target_id,
-                relation=relation,
-                note=spec.get("note", ""),
-                kb=tkb,
-            )
+            entry.add_link(target=target_id, relation=relation, note=note, kb=tkb)
             results[i] = {"status": "created"}
             dirty.setdefault(source_id, []).append(i)
 
@@ -1699,9 +1972,33 @@ class KBService:
                 entry.touch_updated_at()
                 self._doc_mgr.save_entry(entry, kb_name, kb_config)
             except Exception as e:
+                # Once per failed save, not once per position: one cause, one line.
+                message = _safe_message(e)
                 for i in positions:
-                    results[i] = {"status": "failed", "error": _safe_message(e)}
+                    results[i] = {"status": "failed", "error": message}
         return results
+
+    def _checked_bulk_spec(self, spec: Any, kb_name: str) -> tuple[str, str, str, str, str]:
+        """One ``add_links`` spec as ``(source, target, relation, note,
+        target_kb)``, or the refusal that fails it alone."""
+        if not isinstance(spec, dict):
+            raise ValidationError(f"expected a mapping, got {type(spec).__name__}")
+        for key in ("source", "target"):
+            if spec.get(key) is None:
+                raise ValidationError(f"missing required field '{key}'")
+        source_id = spec["source"]
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise ValidationError(f"A link needs a source entry id; got {source_id!r}.")
+        target_id, relation, note = check_link_spec(
+            spec["target"],
+            spec.get("relation"),
+            note=spec.get("note"),
+            target_kb=spec.get("target_kb"),
+        )
+        tkb = spec.get("target_kb") or kb_name
+        if self.config.get_kb(tkb) is None:
+            raise KBNotFoundError(f"KB not found: {tkb}")
+        return source_id, target_id, relation, note, tkb
 
     # =========================================================================
     # Query Operations (read-only, delegate to db)
@@ -2063,7 +2360,12 @@ class KBService:
         return [], how
 
     def orient_overview(
-        self, *, readable_kbs: set[str] | None, detail: str | None = None
+        self,
+        *,
+        readable_kbs: set[str] | None,
+        detail: str | None = None,
+        limit: int | None = 50,
+        offset: int = 0,
     ) -> dict[str, Any]:
         """Orient with no KB named: the first call of a session.
 
@@ -2074,18 +2376,43 @@ class KBService:
         per-type blocks here to omit.
         """
         self._orient_detail(detail)
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100
+        ):
+            raise ValidationError("limit must be between 1 and 100")
+        if (
+            isinstance(offset, bool)
+            or not isinstance(offset, int)
+            or offset < 0
+            or (limit is None and offset)
+        ):
+            raise ValidationError("offset must be non-negative and requires a limit")
+
+        registry = self._registry
+        if registry is None:
+            from .kb_registry_service import KBRegistryService
+
+            registry = KBRegistryService(self.config, self.db)
+        page = registry.list_kbs(
+            limit=limit + 1 if limit is not None else None,
+            offset=offset,
+            kb_names=readable_kbs,
+            include_yaml_origin=False,
+        )
+        has_more = limit is not None and len(page) > limit
+        if limit is not None:
+            page = page[:limit]
         kbs = [
             {
-                "name": kb.name,
-                "type": kb.kb_type or "default",
-                "description": kb.description or "",
-                "entry_count": self.count_entries(kb_name=kb.name),
-                "read_only": kb.read_only,
+                "name": kb["name"],
+                "type": kb["type"],
+                "description": kb.get("description") or "",
+                "entry_count": kb["entries"],
+                "read_only": kb.get("read_only", False),
             }
-            for kb in sorted(self.config.all_kbs(), key=lambda k: k.name)
-            if readable_kbs is None or kb.name in readable_kbs
+            for kb in page
         ]
-        return {
+        result = {
             "knowledge_bases": kbs,
             "operational_contracts": self._operational_contracts(),
             "next": (
@@ -2093,6 +2420,9 @@ class KBService:
                 "(CLI). Add detail='brief' (`--detail brief`) for a read session."
             ),
         }
+        if limit is not None:
+            result.update({"limit": limit, "offset": offset, "has_more": has_more})
+        return result
 
     def orient(
         self, kb_name: str, recent_limit: int = 5, *, detail: str | None = None
@@ -2332,6 +2662,30 @@ class KBService:
             if entry_id.startswith("daily-") and len(entry_id) >= 16:
                 dates.append(entry_id[6:])  # strip "daily-"
         return dates
+
+    def require_entry(self, entry_id: str, kb_name: str) -> None:
+        """Raise unless ``entry_id`` exists in ``kb_name``: an empty answer about
+        a subject that is not there is a lie, so a reader asks this first.
+
+        Index first, disk as the verdict, as ``add_link``'s target check does:
+        the index is a derived cache, so a miss in it is a reason to ask the
+        repository, not an answer (design principle 5). Raises
+        ``KBNotFoundError`` for an unknown KB, ``EntryNotFoundError`` for an
+        absent entry.
+        """
+        kb_config = self.config.get_kb(kb_name)
+        if kb_config is None:
+            raise KBNotFoundError(f"KB not found: {kb_name}")
+        if self.db.get_entry(entry_id, kb_name) is not None:
+            return
+        if KBRepository(kb_config).load(entry_id) is not None:
+            return
+        # A link to a page that does not exist yet is stored and answered (a
+        # red link, `[[ghost-page]]`): the subject is absent, but the question
+        # "what links here" has an answer. Refuse only when nothing links to it.
+        if self.db.get_backlinks(entry_id, kb_name, limit=1, readable_kbs=None):
+            return
+        raise EntryNotFoundError(f"Entry not found: {entry_id}")
 
     def load_entry_from_disk(self, entry_id: str, kb_name: str) -> Entry | None:
         """Load an entry from disk via KBRepository."""
@@ -2592,6 +2946,32 @@ class KBService:
         """
         return self._index_mgr.sync_incremental(kb_name)
 
+    def index_is_empty(self) -> bool:
+        """True when nothing is indexed yet (the first search builds it)."""
+        return self._index_mgr.is_empty()
+
+    def build_index(self) -> Any:
+        """Index every configured KB from its files (``IndexManager.index_all``)."""
+        return self._index_mgr.index_all()
+
+    def index_kb(self, kb_name: str) -> int:
+        """Index one KB from its files; returns the entry count (``IndexManager.index_kb``)."""
+        return self._index_mgr.index_kb(kb_name)
+
+    def check_index_health(self, kb_name: str | None = None) -> dict[str, Any]:
+        """Compare the index with the files (``IndexManager.check_health``)."""
+        return self._index_mgr.check_health(kb_name)
+
+    def stale_kbs(self, kb_name: str | None = None) -> list[str]:
+        """Names of KBs with a file on disk newer than the index (cheap mtime probe).
+
+        Scoped to ``kb_name`` when given.
+        """
+        stale = self._index_mgr.check_staleness()
+        if kb_name:
+            stale = [s for s in stale if s["kb"] == kb_name]
+        return [s["kb"] for s in stale]
+
     def get_index_stats(self) -> dict[str, Any]:
         """Get index statistics."""
         return self._index_mgr.get_index_stats()
@@ -2782,7 +3162,7 @@ class KBService:
             # Already logged above (with a traceback) -- public_message, when
             # set, is what the caller sees; str(e) can carry server-side
             # detail (ADR-0037 theme 2 round 2, item 1).
-            push_error = getattr(e, "public_message", None) or str(e)
+            push_error = public_text(e, already_logged=True, log=logger)
 
         return {
             "success": True,
@@ -2803,14 +3183,32 @@ class KBService:
 
 
 def _as_field_type(entry: Entry, key: str, value: Any) -> Any:
-    """``value`` as the type an Enum-valued field holds, or refused.
+    """Coerce an update value to the model type expected for its field.
 
-    Every surface sends a field's value as a string (`status: disputed`), and
-    an Enum field (`EventEntry.status`) assigned a str failed later, at
-    `to_frontmatter`'s `.value`, as `INTERNAL: 'str' object has no attribute
-    'value'` -- for a deliberate set and for an echoed read result alike
-    (#561). An unknown value is refused before anything is written.
+    Enum fields arrive as strings such as status values, and assigning a
+    string to EventEntry.status failed later during frontmatter serialization
+    (#561). Source and Link lists arrive as JSON dictionaries on reads and are
+    restored to typed objects here, before validation or serialization.
+    Unsupported input is refused before anything is written.
     """
+    if key in ("sources", "links"):
+        item_type = Source if key == "sources" else Link
+        if not isinstance(value, list):
+            raise ValidationError(
+                f"Cannot set {key} on {entry.entry_type} '{entry.id}': expected a list of objects."
+            )
+        converted = []
+        for index, item in enumerate(value):
+            if isinstance(item, item_type):
+                converted.append(item)
+            elif isinstance(item, dict):
+                converted.append(item_type.from_dict(item))
+            else:
+                raise ValidationError(
+                    f"Cannot set {key}[{index}] on {entry.entry_type} '{entry.id}': expected an object."
+                )
+        return converted
+
     current = getattr(entry, key, None)
     if not isinstance(current, Enum) or isinstance(value, type(current)):
         return value

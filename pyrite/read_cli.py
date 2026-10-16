@@ -13,14 +13,19 @@ from rich.console import Console
 from rich.table import Table
 
 from .cli.context import open_index_db
+from .cli.output import validate_output_format
 from .cli.search_commands import register_search_command
 from .config import CONFIG_FILE, load_config
-from .exceptions import PyriteError
+from .exceptions import PyriteError, refusal_fields
 from .logging import configure_entry_point_logging, logging_epilog
 from .services.access_policy import UNSCOPED
 from .services.kb_service import KBService
+from .utils.errors import PyriteCLIGroup
 
+# The same root as `pyrite` and `pyrite-admin`: the one point a command's
+# Outcome is rendered and its exit code set (ADR-0046).
 app = typer.Typer(
+    cls=PyriteCLIGroup,
     name="pyrite-read",
     help="Pyrite read-only CLI — search, browse, retrieve (safe for AI agents)",
     no_args_is_help=True,
@@ -31,19 +36,35 @@ console = Console()
 err_console = Console(stderr=True)
 
 
-def _emit_error(message: str, output_format: str, *, error_code: str = "ERROR") -> None:
+def _emit_error(
+    message: str,
+    output_format: str,
+    *,
+    error_code: str = "ERROR",
+    suggestion: str | None = None,
+    extra: dict | None = None,
+) -> None:
     """Report a CLI error without polluting stdout in machine formats.
 
     In a non-rich format, write a valid JSON error object to stdout so a
     programmatic caller's ``json.load()`` still parses; otherwise print a
     human-readable error to stderr. Either way stdout stays parseable.
+    ``extra`` carries a refusal's public fields (``refusal_fields``: the
+    candidate KBs of an ``AMBIGUOUS`` id, #528).
     """
     if output_format and output_format != "rich":
         import json
 
-        typer.echo(json.dumps({"error": message, "error_code": error_code}))
+        payload = {**(extra or {}), "error": message, "error_code": error_code}
+        if suggestion:
+            payload["suggestion"] = suggestion
+        typer.echo(json.dumps(payload))
     else:
-        err_console.print(f"[red]Error:[/red] {message}")
+        from rich.text import Text
+
+        err_console.print("[red]Error:[/red]", Text(message))
+        if suggestion:
+            err_console.print("    [dim]hint:[/dim]", Text(suggestion))
 
 
 def _get_svc():
@@ -73,7 +94,10 @@ def get_entry(
     entry_id: str = typer.Argument(..., help="Entry ID"),
     kb_name: str | None = typer.Option(None, "--kb", "-k", help="KB to search in"),
     output_format: str = typer.Option(
-        "rich", "--format", help="Output format: rich, json, markdown, csv, yaml"
+        "rich",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: rich, json, markdown, csv, yaml",
     ),
 ):
     """Get a specific entry by ID."""
@@ -112,7 +136,13 @@ def get_entry(
                 else:
                     console.print(f"  • {src.title}: {src.url}")
     except (PyriteError, ValueError) as e:
-        _emit_error(str(e), output_format)
+        _emit_error(
+            str(e),
+            output_format,
+            error_code=getattr(e, "error_code", "ERROR"),
+            suggestion=getattr(e, "suggestion", None),
+            extra=refusal_fields(e),
+        )
         raise typer.Exit(1) from None
     finally:
         db.close()
@@ -126,7 +156,10 @@ def get_entry(
 @app.command("list")
 def list_kbs(
     output_format: str = typer.Option(
-        "rich", "--format", help="Output format: rich, json, markdown, csv, yaml"
+        "rich",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: rich, json, markdown, csv, yaml",
     ),
 ):
     """List all knowledge bases."""
@@ -181,7 +214,10 @@ def timeline(
     min_importance: int = typer.Option(1, "--min-importance", help="Minimum importance (1-10)"),
     limit: int = typer.Option(50, "--limit", "-n", help="Max results"),
     output_format: str = typer.Option(
-        "rich", "--format", help="Output format: rich, json, markdown, csv, yaml"
+        "rich",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: rich, json, markdown, csv, yaml",
     ),
 ):
     """Query timeline events."""
@@ -236,7 +272,10 @@ def tags_cmd(
     prefix: str = typer.Option(None, "--prefix", "-p", help="Filter tags by prefix"),
     limit: int = typer.Option(100, "--limit", "-n", help="Max tags to show"),
     output_format: str = typer.Option(
-        "rich", "--format", help="Output format: rich, json, markdown, csv, yaml"
+        "rich",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: rich, json, markdown, csv, yaml",
     ),
 ):
     """List tags with counts."""
@@ -282,7 +321,10 @@ def backlinks_cmd(
     entry_id: str = typer.Argument(..., help="Entry ID to find backlinks for"),
     kb_name: str = typer.Option(..., "--kb", "-k", help="Knowledge base name"),
     output_format: str = typer.Option(
-        "rich", "--format", help="Output format: rich, json, markdown, csv, yaml"
+        "rich",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: rich, json, markdown, csv, yaml",
     ),
 ):
     """Find entries that link to a given entry."""
@@ -290,10 +332,13 @@ def backlinks_cmd(
     try:
         from .services.graph_service import GraphService
 
+        # A subject that is not there is NOT_FOUND, not an empty list (#526).
+        svc.require_entry(entry_id, kb_name)
+
         graph_svc = GraphService(db)
         links = graph_svc.get_backlinks(entry_id, kb_name, readable_kbs=UNSCOPED)
 
-        if not links:
+        if not links and output_format == "rich":
             console.print(f"[yellow]No backlinks found for '{entry_id}'.[/yellow]")
             return
 
@@ -308,7 +353,7 @@ def backlinks_cmd(
 
         console.print(backlinks_table(entry_id, links))
     except (PyriteError, ValueError) as e:
-        _emit_error(str(e), output_format)
+        _emit_error(str(e), output_format, error_code=getattr(e, "error_code", "ERROR"))
         raise typer.Exit(1) from None
     finally:
         db.close()
