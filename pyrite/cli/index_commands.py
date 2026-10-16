@@ -10,8 +10,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from ..utils.errors import cli_error
+from ..utils.errors import PARTIAL_EXIT, cli_error, exit_unless_whole
 from .context import cli_db_context, get_config_and_db
+from .output import validate_output_format
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +26,7 @@ def _format_output(data: dict, fmt: str) -> str | None:
     return format_output(data, fmt)
 
 
-def _settle_embed_queue(db) -> int:
+def _settle_embed_queue(db, model_name: str | None = None) -> int:
     """Pay off whatever ADR-0035 writes left in `embed_queue`.
 
     Shares one implementation with the server (`settle_embed_queue`), which is
@@ -44,7 +45,7 @@ def _settle_embed_queue(db) -> int:
     """
     from ..services.embedding_worker import settle_embed_queue
 
-    return settle_embed_queue(db)
+    return settle_embed_queue(db, model_name=model_name)
 
 
 def _embed_counts(stats: dict, from_queue: int, force: bool) -> tuple[int, int, int]:
@@ -187,7 +188,7 @@ def index_build(
                 # *skip* it -- it only asks whether a vector exists, not
                 # whether it is current -- so an update's row must be settled
                 # before, not after.
-                _settle_embed_queue(db)
+                _settle_embed_queue(db, model_name=config.settings.embedding_model)
                 svc = EmbeddingService(db, model_name=config.settings.embedding_model)
                 stats = svc.embed_all(kb_name=kb_name, force=force)
                 if stats["embedded"] > 0:
@@ -204,9 +205,17 @@ def index_sync(
     kb_name: str | None = typer.Option(None, "--kb", "-k", help="KB to sync (all if omitted)"),
     no_embed: bool = typer.Option(False, "--no-embed", help="Skip auto-embedding after sync"),
     background: bool = typer.Option(False, "--background", help="Run in background thread"),
+    verify: bool = typer.Option(
+        False,
+        "--verify",
+        help="Hash all known files whose stat is unchanged and sync changed content (foreground only).",
+    ),
 ):
-    """Incremental sync: update index for changed files only."""
+    """Incremental sync, with optional content-hash verification."""
     from ..storage import IndexManager
+
+    if background and verify:
+        raise typer.BadParameter("--verify cannot be combined with --background")
 
     config, db = get_config_and_db()
 
@@ -221,7 +230,10 @@ def index_sync(
 
     index_mgr = IndexManager(db, config)
 
-    results = index_mgr.sync_incremental(kb_name)
+    if verify:
+        results = index_mgr.sync_incremental(kb_name, verify=True)
+    else:
+        results = index_mgr.sync_incremental(kb_name)
 
     console.print("[green]Sync complete:[/green]")
     console.print(f"  Added: {results['added']}")
@@ -236,6 +248,18 @@ def index_sync(
             console.print(f"    [dim]• {entry['path']}[/dim]")
         if len(malformed) > 5:
             console.print(f"    [dim]… and {len(malformed) - 5} more[/dim]")
+    skipped = results.get("skipped", [])
+    if skipped:
+        console.print(f"  [yellow]Non-regular: {len(skipped)} file(s) skipped[/yellow]")
+        for entry in skipped[:5]:
+            console.print(
+                f"    {entry['path']}: {entry['reason']}",
+                markup=False,
+                highlight=False,
+            )
+        if len(skipped) > 5:
+            console.print(f"    [dim]... and {len(skipped) - 5} more[/dim]")
+
     duplicates = results.get("duplicates", [])
     if duplicates:
         console.print(
@@ -255,7 +279,7 @@ def index_sync(
     # `embed_all(force=False)` would skip it because a (stale) vector exists.
     changed = results["added"] + results["updated"]
     if not no_embed:
-        _settle_embed_queue(db)
+        _settle_embed_queue(db, model_name=config.settings.embedding_model)
 
     if changed > 0 and not no_embed:
         try:
@@ -273,7 +297,10 @@ def index_sync(
 @index_app.command("stats")
 def index_stats(
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """Show index statistics."""
@@ -327,7 +354,7 @@ def index_embed(
         cli_error(
             "sentence-transformers is not installed.",
             error_code="DEPENDENCY_MISSING",
-            suggestion="install with: pip install pyrite[semantic]",
+            suggestion=semantic_unavailable(False)[2],
         )
 
     config, db = get_config_and_db()
@@ -359,7 +386,7 @@ def index_embed(
     # anything that already has a vector, stale or not.
     from ..services.embedding_worker import settle_embed_queue_by_kb
 
-    by_kb = settle_embed_queue_by_kb(db)
+    by_kb = settle_embed_queue_by_kb(db, model_name=config.settings.embedding_model)
     from_queue = sum(by_kb.values()) if kb_name is None else by_kb.get(kb_name, 0)
     # The drain settles every KB's queue, whatever --kb says; entries in other
     # KBs are embedded too, and are not in this run's counts below.
@@ -410,12 +437,21 @@ def index_embed(
         )
     if stats["errors"]:
         console.print(f"  [red]Errors: {stats['errors']}[/red]")
+        console.print(
+            "  [dim]Those entries are still owed an embedding; "
+            "`pyrite index embed` retries them.[/dim]"
+        )
+        # The batch rule (#526): 3 if some were embedded or already were, 1 if none.
+        exit_unless_whole(stats["errors"], embedded + skipped)
 
 
 @index_app.command("health")
 def index_health(
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
     kb_name: str = typer.Option(
         None, "--kb", "-k", help="Only check this KB (default: every configured KB)"
@@ -474,6 +510,8 @@ def index_health(
     has_warning = (
         bool(broken_links)
         or bool(undeclared_types)
+        or bool(health.get("type_name_drift_total"))
+        or bool(health.get("schema_errors"))
         or bool(missing_required)
         or bool(subdirectory_mismatches)
         or bool(malformed_frontmatter)
@@ -497,6 +535,10 @@ def index_health(
             "invalid_statuses": invalid_statuses,
             "off_list_values": off_list_values,
             "duplicates": duplicates,
+            "type_name_drift": health.get("type_name_drift", []),
+            "type_name_drift_total": health.get("type_name_drift_total", 0),
+            "type_name_drift_has_more": health.get("type_name_drift_has_more", False),
+            "schema_errors": health.get("schema_errors", []),
             "checks": health,
         },
         output_format,
@@ -556,6 +598,24 @@ def _report_health(
             f"[yellow]⚠ {broken_links} broken link(s) found.[/yellow]"
             " Run 'pyrite links check' for details."
         )
+
+    for err in health.get("schema_errors", []):
+        console.print(
+            f"kb.yaml failed to load for {err['kb']}: {err['error']}",
+            style="yellow",
+            markup=False,
+            highlight=False,
+        )
+
+    if health.get("type_name_drift_total"):
+        console.print(
+            f"[yellow]Type name drift: {health['type_name_drift_total']} group(s)[/yellow]"
+        )
+        for group in health["type_name_drift"][:10]:
+            names = ", ".join(f"{r['type']} ({r['count']})" for r in group["spellings"][:10])
+            console.print(f"  • {group['kb']}: {names}", markup=False)
+        if health["type_name_drift_total"] > 10:
+            console.print("  ... use --format json for the bounded report and totals")
 
     if undeclared_types:
         total = sum(row["count"] for row in undeclared_types)
@@ -700,6 +760,8 @@ def index_reconcile(
             console.print(
                 f"[yellow]No moves planned; {len(result.errors)} entry path(s) could not be checked.[/yellow]"
             )
+        if result.errors:
+            raise typer.Exit(PARTIAL_EXIT)
         return
 
     table = Table(title=f"{'[DRY RUN] ' if not apply else ''}Files to move")
@@ -721,14 +783,18 @@ def index_reconcile(
 
     if not apply:
         console.print("\n[yellow]Dry run. Use --apply to execute moves.[/yellow]")
+        if result.errors:
+            raise typer.Exit(PARTIAL_EXIT)
         return
 
     if result.read_only:
         console.print("[red]Cannot move files in a read-only KB.[/red]")
-        return
+        raise typer.Exit(1)
 
     console.print(f"\n[green]Moved {result.moved} file(s).[/green]")
     console.print("The index was updated for successfully moved files.")
+    # Moves that failed were reported above; some moved, some did not.
+    exit_unless_whole(len(result.errors), result.moved)
 
 
 @index_app.command("jobs")

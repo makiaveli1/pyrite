@@ -38,10 +38,10 @@ from ..exceptions import (
 from ..logging import configure_entry_point_logging
 from ..services.access_policy import UNSCOPED
 from ..services.kb_service import KBService
-from ..utils.errors import PyriteCLIGroup, cli_error
+from ..utils.errors import PyriteCLIGroup, cli_error, exit_unless_whole
 from .browse_commands import register_browse_commands
 from .collection_commands import collections_app
-from .context import cli_context, open_index_db
+from .context import cli_context, get_config_and_db, open_index_db
 from .db_commands import db_app
 from .entry_commands import register_entry_commands
 from .export_commands import export_app
@@ -51,7 +51,8 @@ from .index_commands import index_app
 from .init_command import init_kb
 from .kb_commands import kb_app
 from .link_commands import links_app
-from .mcp_setup_command import mcp_setup, mcp_tool_counts
+from .mcp_setup_command import MCP_CHECK_OK, mcp_setup, mcp_tool_counts
+from .output import output_format_choice, validate_output_format
 from .protocol_commands import protocol_app
 from .qa_commands import qa_app
 from .repo_commands import repo_collab_app
@@ -185,7 +186,20 @@ app.add_typer(task_app, name="task")
 try:
     from ..plugins import get_registry
 
-    for name, command in get_registry().get_all_cli_commands():
+    _registry = get_registry()
+    _cli_commands = _registry.get_all_cli_commands()
+    # A plugin whose get_cli_commands raised vanishes from `app`; say so on
+    # stderr rather than only in a logger nobody listens to (#900).
+    for _plugin, _method, _exc in _registry.aggregate_failures:
+        if _method == "get_cli_commands":
+            import sys as _sys
+
+            print(
+                f"pyrite: plugin '{_plugin}' CLI commands are unavailable: "
+                f"{type(_exc).__name__}: {_exc}",
+                file=_sys.stderr,
+            )
+    for name, command in _cli_commands:
         if hasattr(command, "registered_commands"):
             # It's a Typer app — register as sub-app
             app.add_typer(command, name=name)
@@ -212,64 +226,82 @@ def _format_output(data: dict, fmt: str) -> str | None:
 @app.command("ci")
 def ci_command(
     kb: str | None = typer.Option(None, "--kb", help="Validate specific KB"),
-    output_format: str = typer.Option("text", "--format", help="Output format: text or json"),
+    output_format: str = typer.Option(
+        "text",
+        "--format",
+        callback=output_format_choice("text", "json"),
+        help="Output format: text or json",
+    ),
     severity: str = typer.Option(
         "warning", "--severity", help="Minimum severity to fail on: error or warning"
     ),
     tier: int = typer.Option(
-        1, "--tier", help="Assessment tier: 1=structural, 2=structural+LLM judgment"
+        1,
+        "--tier",
+        help="Assessment tier: 1=structural, 2=structural plus the model-judged rubric "
+        "(one model call per entry with judgment items; needs a configured model)",
     ),
 ):
     """CI/CD-optimized KB validation. Exits 0 on pass, 1 on failure.
 
     Validates knowledge base integrity and reports results in a format
     suitable for CI pipelines. Use --format json for machine-readable output.
-    Use --tier 2 to include LLM-assisted rubric evaluation (requires AI config).
+    Use --tier 2 to include the model-judged rubric: its findings are warnings
+    that count at the gate, and an entry the model did not answer for is an
+    `evaluation_failed` error. With no model configured, --tier 2 is refused
+    (AI_NOT_CONFIGURED); an unknown tier is refused (INVALID_TIER).
+
+    Without --kb, every KB is validated: those in the config and those
+    registered in the index (`pyrite kb add`). A KB whose folder is missing or
+    unreadable fails with one `kb_unreadable` error, and the others are still
+    validated.
     """
+    from ..services.llm_service import LLMService
     from ..services.qa_service import QAService
+    from ..utils.errors import cli_error_from
 
     config = load_config()
 
-    # Handle no KBs configured
-    if not config.knowledge_bases:
-        if output_format == "json":
-            typer.echo(
-                _json.dumps(
-                    {
-                        "kbs": [],
-                        "total_entries": 0,
-                        "total_errors": 0,
-                        "total_warnings": 0,
-                        "result": "pass",
-                    }
-                )
-            )
-        else:
-            typer.echo("pyrite ci — no KBs configured, nothing to validate.")
-        raise typer.Exit(0)
-
-    db = open_index_db(config)
+    # A tier that cannot run is refused before anything else, even with no
+    # KB to validate: `ci` never says "pass" for a tier that did not run (#795).
+    llm_service = LLMService(config.settings) if tier >= 2 else None
     try:
-        # Set up LLM service for tier >= 2
-        llm_service = None
-        if tier >= 2:
-            from ..services.llm_service import LLMService
+        QAService(config, None, llm_service=llm_service).require_tier(tier)
+    except PyriteError as exc:
+        cli_error_from(exc, output_format)
+    # Resolve KBs as the other commands do, DB-registered ones merged, so a
+    # named KB's checks (schema, files, rubric) read its real config. A KB
+    # that resolves to nothing is refused: the index alone cannot run them,
+    # and validating nothing is not a pass (#795).
+    config, db = get_config_and_db(config)
+    try:
+        if kb and config.get_kb(kb) is None:
+            cli_error_from(KBNotFoundError(f"KB '{kb}' is not configured"), output_format)
 
-            llm_service = LLMService(config.settings)
-            if not llm_service.status()["configured"]:
-                if output_format != "json":
-                    typer.echo(
-                        "Note: LLM not configured — tier 2 evaluation will skip "
-                        "judgment rubric items. Configure ai_provider + ai_api_key "
-                        "in pyrite.yaml to enable."
+        # Handle no KBs configured
+        if not config.knowledge_bases:
+            if output_format == "json":
+                typer.echo(
+                    _json.dumps(
+                        {
+                            "kbs": [],
+                            "total_entries": 0,
+                            "total_errors": 0,
+                            "total_warnings": 0,
+                            "result": "pass",
+                        }
                     )
+                )
+            else:
+                typer.echo("pyrite ci — no KBs configured, nothing to validate.")
+            raise typer.Exit(0)
 
         qa = QAService(config, db, llm_service=llm_service)
 
         if kb:
-            result = {"kbs": [qa.validate_kb(kb, readable_kbs=UNSCOPED)]}
+            result = {"kbs": [qa.validate_kb(kb, readable_kbs=UNSCOPED, tier=tier)]}
         else:
-            result = qa.validate_all(readable_kbs=UNSCOPED)
+            result = qa.validate_all(readable_kbs=UNSCOPED, tier=tier)
 
         # Aggregate results
         severity_order = {"error": 0, "warning": 1, "info": 2}
@@ -384,7 +416,10 @@ def ci_command(
 @app.command("list")
 def list_kbs(
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """List all knowledge bases."""
@@ -604,7 +639,10 @@ def repo_remove(
 @auth_app.command("status")
 def auth_status(
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """Check GitHub authentication status."""
@@ -626,7 +664,10 @@ def auth_status(
 @auth_app.command("whoami")
 def auth_whoami(
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """Show current user identity."""
@@ -750,6 +791,9 @@ def mcp_server(
         "--tier",
         help="Tool tier to expose: read, write, or admin",
     ),
+    # For `pyrite mcp-setup`'s start check, not part of the CLI surface: read
+    # the arguments exactly as a start would, then stop before the server.
+    check: bool = typer.Option(False, "--check", hidden=True),
 ):
     from ..server.mcp_server import PyriteMCPServer
 
@@ -760,6 +804,9 @@ def mcp_server(
             error_code="INVALID_TIER",
             suggestion=f"choose one of: {', '.join(PyriteMCPServer.VALID_TIERS)}",
         )
+    if check:
+        typer.echo(f"{MCP_CHECK_OK} (tier {tier})")
+        return
 
     # stderr, not stdout -- stdout carries the MCP protocol stream itself.
     Console(stderr=True).print(f"[dim]Starting MCP server ({tier} tier) on stdio...[/dim]")
@@ -816,12 +863,9 @@ def import_entries(
     does not close or parse) is refused whole before any record is written.
     """
     from ..formats.importers import get_importer_registry
+    from .context import input_file_or_exit
 
-    if not file_path.exists():
-        cli_error(
-            f"File not found: {file_path}",
-            error_code="NOT_FOUND",
-        )
+    input_file_or_exit(file_path, "File")  # `--format` here is the file's format
 
     # Auto-detect format from extension
     if fmt is None:
@@ -888,6 +932,9 @@ def import_entries(
                 if not r.get("valid"):
                     console.print(_refusal_line("Would refuse", record, r))
             console.print("\n[dim]No entries were created (--dry-run).[/dim]")
+            # A dry run that would refuse exits as the real run would (#526).
+            would_refuse = sum(1 for r in results if not r.get("valid"))
+            exit_unless_whole(would_refuse, len(results) - would_refuse)
             return
 
         created = 0
@@ -916,8 +963,8 @@ def import_entries(
         # body, an existing id, an undeclared type, a schema violation. Exit
         # non-zero so a script or agent cannot read "Imported N" off a run
         # that silently dropped records.
-        if failed:
-            raise typer.Exit(1)
+        # Some written and some refused is a partial run (3); none written is 1.
+        exit_unless_whole(failed, created)
 
 
 # =============================================================================

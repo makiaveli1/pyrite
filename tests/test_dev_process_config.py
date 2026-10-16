@@ -261,6 +261,7 @@ class TestParallelSuite:
             capture_output=True,
             text=True,
             env={**os.environ, "PYRITE_PUSH_FULL": value},
+            timeout=120,
         )
         assert out.returncode == 0, out.stderr
         assert ("tests/ extensions/" in out.stdout) is full, out.stdout
@@ -356,6 +357,7 @@ class TestParallelSuite:
             for job in ci["jobs"].values()
             for step in job["steps"]
             if "pytest" in str(step.get("run", ""))
+            and "--collect-only" not in str(step.get("run", ""))
         ]
         assert runs, "no pytest step in CI"
         assert all("-n auto" in r for r in runs), runs
@@ -387,7 +389,7 @@ class TestPinnedTestRunner:
     silent `uv pip install` drift.
     """
 
-    _PINNED = {"pytest", "pytest-cov", "pytest-xdist", "pytest-timeout"}
+    _PINNED = {"pytest", "pytest-cov", "pytest-xdist", "pytest-timeout", "pytest-split"}
 
     def _dev_extra(self, pyproject: dict) -> list[str]:
         return pyproject["project"]["optional-dependencies"]["dev"]
@@ -510,7 +512,7 @@ class TestSessionSetupScript:
         script = REPO / "scripts" / "new-worktree.sh"
         assert script.exists(), "ADR-0032 migration step 3: scripts/new-worktree.sh"
         assert os.access(script, os.X_OK), "must be executable"
-        subprocess.run(["bash", "-n", str(script)], check=True)
+        subprocess.run(["bash", "-n", str(script)], check=True, timeout=120)
         text = script.read_text()
         assert "git worktree add" in text and "pre-commit install" in text
         # The hook shim embeds the installing Python's path. Installing from a
@@ -546,7 +548,7 @@ class TestCloudSessionSetup:
         script = REPO / "scripts" / name
         assert script.exists()
         assert os.access(script, os.X_OK), "must be executable"
-        subprocess.run(["bash", "-n", str(script)], check=True)
+        subprocess.run(["bash", "-n", str(script)], check=True, timeout=120)
 
     def test_setup_installs_pyrite_every_extension_and_a_local_config(self):
         text = self.SETUP.read_text()
@@ -584,42 +586,52 @@ class TestCloudSessionSetup:
         text = self.START.read_text()
         assert "CLAUDE_ENV_FILE" in text and ".venv/bin" in text
 
-    def test_skills_and_agents_carry_no_machine_specific_paths(self):
+    def _agent_instruction_files(self):
+        """Every file a contributor's agent loads from this repo."""
+        skills = sorted((REPO / ".claude" / "skills").rglob("*.md"))
+        return [*skills, REPO / "CLAUDE.md", REPO / "AGENTS.md", REPO / "CONTRIBUTING.md"]
+
+    def test_agent_instructions_carry_no_machine_specific_paths(self):
         # A cloud session's (or a contributor's) checkout is not one
         # maintainer's home directory. (A bare "/Users/" grep pattern is fine.)
+        # CLAUDE.md, AGENTS.md and CONTRIBUTING.md are scanned too: CLAUDE.md
+        # once named /Users/markr/pyrite and nothing checked it.
         import re
 
         home = re.compile(r"/(Users|home)/[A-Za-z]")
         offenders = [
             f"{path.relative_to(REPO)}:{n}"
-            for base in (REPO / ".claude" / "skills", REPO / ".claude" / "agents")
-            for path in base.rglob("*.md")
+            for path in self._agent_instruction_files()
             for n, line in enumerate(path.read_text().splitlines(), 1)
             if home.search(line)
         ]
         assert offenders == []
 
-    def test_skills_and_agents_name_no_private_kb_or_plugin(self):
-        # The loop must run for any contributor: the tick log's location is a
-        # setting (PYRITE_CONDUCTOR_LOG_DIR), and the maintainer's private KB
-        # and plugin are not part of the project's workflow.
+    def test_agent_instructions_name_no_private_kb_or_plugin(self):
+        # The maintainer's private KB, desk and plugin are not part of the
+        # project's workflow; a contributor's agent must never be sent there.
         import re
 
         private = re.compile(r"tcp-kb-internal|tcp-skills|pyrite-desk|desk/notes")
         offenders = [
             f"{path.relative_to(REPO)}:{n}"
-            for base in (REPO / ".claude" / "skills", REPO / ".claude" / "agents")
-            for path in base.rglob("*.md")
+            for path in self._agent_instruction_files()
             for n, line in enumerate(path.read_text().splitlines(), 1)
             if private.search(line)
         ]
         assert offenders == []
 
-    def test_conductor_log_dir_setting_is_stated_once_and_gitignored(self):
-        conductor = (REPO / ".claude/skills/pyrite-conductor/SKILL.md").read_text()
-        meta = (REPO / ".claude/skills/pyrite-meta-conductor/SKILL.md").read_text()
-        assert conductor.count("PYRITE_CONDUCTOR_LOG_DIR") >= 1
-        assert "PYRITE_CONDUCTOR_LOG_DIR" in meta, "the retro must find the log"
+    def test_the_repo_ships_only_the_contributor_skills_and_no_loop_agents(self):
+        # The maintainer's orchestration loop (conductor, meta-conductor, the
+        # loop agents) lives outside the repo; a second copy here drifted from
+        # the real one (#244). What stays is what a contributor's agent loads.
+        skills = {p.name for p in (REPO / ".claude" / "skills").iterdir() if p.is_dir()}
+        assert skills == {"pyrite-dev", "kb", "software-kb", "extension-builder", "kb-lifecycle"}
+        assert not (REPO / ".claude" / "agents").exists()
+
+    def test_the_external_loops_default_log_dir_stays_gitignored(self):
+        # The loop outside the repo writes its tick log to `.pyrite-conductor/`
+        # at a checkout's root by default; it must never be committed.
         ignored = (REPO / ".gitignore").read_text().splitlines()
         assert ".pyrite-conductor/" in ignored, "the default log dir must be gitignored"
 
@@ -646,7 +658,7 @@ class TestCloudEnvironment:
         script = REPO / "scripts" / name
         assert script.exists()
         assert os.access(script, os.X_OK), "must be executable"
-        subprocess.run(["bash", "-n", str(script)], check=True)
+        subprocess.run(["bash", "-n", str(script)], check=True, timeout=120)
 
     def test_postgres_image_and_credentials_match_ci(self, ci):
         import re
@@ -769,7 +781,7 @@ class TestCloudEnvironment:
         (repo / "extensions" / "ext").mkdir(parents=True)
         (repo / "extensions" / "ext" / "pyproject.toml").write_text("[project]\nname='e'\n")
         (repo / "kb").mkdir()
-        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "init", "-q", str(repo)], check=True, timeout=120)
 
         uv_log = tmp_path / "uv-calls.log"
         uv = fake_docker[0].parent / "uv"
@@ -1030,7 +1042,7 @@ class TestSmokeLayer:
         script = REPO / "scripts" / "run_tutorial.sh"
         assert script.exists(), "docs-as-tests runner for docs/getting-started.md"
         assert os.access(script, os.X_OK), "must be executable"
-        subprocess.run(["bash", "-n", str(script)], check=True)
+        subprocess.run(["bash", "-n", str(script)], check=True, timeout=120)
 
 
 class TestNoTrackedFileIsGitignored:
@@ -1053,6 +1065,7 @@ class TestNoTrackedFileIsGitignored:
             check=True,
             capture_output=True,
             text=True,
+            timeout=120,
         ).stdout.strip()
         assert tracked_and_ignored == "", (
             f"tracked but gitignored under .claude/ (add/add-conflict risk): "
@@ -1228,7 +1241,12 @@ class TestDevPushReusesTheMergeQueuesPass:
                 "GITHUB_OUTPUT": str(out),
                 "GH_TOKEN": "x",
             }
-            subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step["run"]], env=env, check=True)
+            subprocess.run(
+                ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+                env=env,
+                check=True,
+                timeout=120,
+            )
             return out.read_text()
 
         return run
@@ -1374,3 +1392,350 @@ class TestExperimentalLayer:
             ]
         )
         assert any(fnmatch.fnmatch(path, g.replace("**", "*")) for g in filt["infra"]), path
+
+
+class TestAVerifiedCommitIsNotTestedAgain:
+    """One definition of a verified commit (scripts/verified_commit.py), read
+    by the pre-push hook and the release script. The behaviour is pinned in
+    tests/test_verified_commit.py, test_test_affected_verified.py and
+    test_release_rehearsal.py; this pins the layout and that each document
+    describing the hook says what it now does."""
+
+    @pytest.mark.control(
+        reason="pins that the hook layout did NOT change with the verified-commit skip; true before it too"
+    )
+    def test_the_hook_entry_is_unchanged_and_the_decision_is_the_scripts(self, precommit):
+        """The skip is not a second hook, a shell condition or a variable in
+        the entry: any of those would be a way around the suite that
+        `scripts/test-affected --preflight` could not report."""
+        (hook,) = [h for h in _hooks(precommit) if _runs_tests(h)]
+        entry = " ".join(hook["entry"].split())
+        assert entry.endswith(
+            'exec "$PY" scripts/test-affected --run -n "${PYRITE_PUSH_WORKERS:-4}"\''
+        )
+        for word in ("gh ", "verified", "gate", "SKIP", "curl"):
+            assert word not in entry, f"{word!r} in the hook entry"
+        pushed = [h for h in _hooks(precommit) if "pre-push" in _stages(h, precommit)]
+        assert [h["id"] for h in pushed] == ["pytest-full"]
+
+    @pytest.mark.control(
+        reason="pins that the hook layout did NOT change with the verified-commit skip; true before it too"
+    )
+    def test_the_shared_module_is_inside_the_hooks_files_filter(self, precommit):
+        import re
+
+        (hook,) = [h for h in _hooks(precommit) if _runs_tests(h)]
+        assert re.search(hook["files"], "scripts/verified_commit.py")
+
+    def test_the_required_check_the_definition_names_is_a_ci_job(self, ci):
+        """A renamed job must not silently mean "nothing is ever verified" --
+        or, worse, leave the definition pointing at a job that no longer
+        gates."""
+        import sys
+
+        sys.path.insert(0, str(REPO / "scripts"))
+        import verified_commit
+
+        for name in verified_commit.REQUIRED_CHECKS:
+            assert name in ci["jobs"], f"{name} is not a job in ci.yml"
+        # `gate` must always report: a skipped gate would count as a pass.
+        assert ci["jobs"]["gate"]["if"] == "always()"
+
+    @pytest.mark.parametrize(
+        "doc",
+        [
+            "CONTRIBUTING.md",
+            "kb/standards/testing-standards.md",
+            "kb/maps/development-process-and-releases.md",
+            ".pre-commit-config.yaml",
+        ],
+    )
+    def test_every_doc_that_says_what_the_hook_runs_says_when_it_does_not(self, doc):
+        text = " ".join((REPO / doc).read_text().replace("#", " ").split())
+        assert "scripts/verified_commit.py" in text, doc
+        assert "verified" in text and "`gate`" in text and "exact SHA" in text, doc
+
+    @pytest.mark.parametrize("doc", ["CONTRIBUTING.md"])
+    def test_the_docs_say_it_fails_closed_and_quote_the_real_timeout(self, doc):
+        import sys
+
+        sys.path.insert(0, str(REPO / "scripts"))
+        import verified_commit
+
+        text = " ".join((REPO / doc).read_text().split())
+        assert "fails closed" in text, doc
+        assert f"{verified_commit.LOOKUP_TIMEOUT_SECONDS} seconds" in text, doc
+        assert "PYRITE_PUSH_FORCE" in text and "PYRITE_PUSH_EXPERIMENTAL" in text
+
+    def test_the_docs_say_what_the_dry_run_rehearses(self):
+        for doc in ("CONTRIBUTING.md",):
+            text = " ".join((REPO / doc).read_text().split())
+            assert "names each one that would stop `--execute`" in text, doc
+
+    def test_claude_md_and_agents_md_link_to_the_process_and_do_not_restate_it(self):
+        """One place per fact: the process lives in CONTRIBUTING.md. The agent
+        entry points link to it and hold none of the hook/verified-commit text
+        (CLAUDE.md once carried 832 words of it, pinned in two places)."""
+        for doc in ("CLAUDE.md", "AGENTS.md"):
+            text = " ".join((REPO / doc).read_text().split())
+            assert "CONTRIBUTING.md" in text, doc
+            for restated in ("exact SHA", "fails closed", "PYRITE_PUSH_WORKERS", "core.hooksPath"):
+                assert restated not in text, (
+                    f"{doc} restates {restated!r}; it belongs in CONTRIBUTING.md"
+                )
+        claude = (REPO / "CLAUDE.md").read_text()
+        assert "@AGENTS.md" in claude, "CLAUDE.md imports the neutral entry point"
+        assert len(claude.splitlines()) <= 60
+
+
+class TestWhatAVerifiedTipIsEvidenceOf:
+    """Fix round 1 of #854: the docs said a verified tip "covers" the full
+    suite. A pull-request `gate` is one interpreter and passes with `test`
+    skipped, so it does not, and an explicit request for the full suite runs."""
+
+    @pytest.mark.parametrize("doc", ["CONTRIBUTING.md", ".pre-commit-config.yaml"])
+    def test_the_docs_say_the_full_suite_still_runs_when_asked_for(self, doc):
+        text = " ".join((REPO / doc).read_text().replace("#", " ").split())
+        assert "PYRITE_PUSH_FULL=1" in text and "one interpreter" in text, doc
+        assert "CI accepted the commit" in text, doc
+        assert "covers the full" not in text and "is covered" not in text, doc
+
+    @pytest.mark.control(
+        reason="pins the CI fact the docs now state; true of ci.yml before this branch"
+    )
+    def test_gate_reports_success_when_the_jobs_it_needs_were_skipped(self, ci):
+        """The fact the docs state: `gate` fails only on failure or
+        cancellation, so a skipped `test` leaves it green."""
+        step = ci["jobs"]["gate"]["steps"][0]["run"]
+        assert "(failure|cancelled)" in step and "skipped" in step
+        assert "test" in ci["jobs"]["gate"]["needs"]
+
+    def test_the_release_script_has_the_push_rehearsal_step_the_docs_describe(self):
+        """The release runbook left the repo with the maintainer's loop, so its
+        prose is no longer pinned here. What stays pinned is the code the
+        contributor-facing docs describe: the dry run has a push-rehearsal step
+        and the hook's preflight exists."""
+        import sys
+
+        sys.path.insert(0, str(REPO / "scripts"))
+        import release
+
+        assert "push_rehearsal" in [s.key for s in release.STEPS]
+        assert "--preflight" in (REPO / "scripts" / "test-affected").read_text()
+
+
+class TestTheRedLineIsFirstAndEveryGatingRunLeavesATimingRecord:
+    """Test-architecture review findings 3 and 4 (tests Q2).
+
+    mypy printed ~700 `error:` lines ahead of pytest in the `test` job, so the
+    red line was never the first thing in the log; and no gating pytest run
+    recorded durations or junit. The layout pinned here: mypy is its own
+    advisory job, every gating pytest invocation records timings, and the
+    required check names did not move.
+    """
+
+    def _gating_pytest_runs(self, ci) -> list[tuple[str, str]]:
+        out = []
+        for job_id in ("test", "smoke"):
+            for step in ci["jobs"][job_id]["steps"]:
+                run = str(step.get("run", ""))
+                if "pytest" in run:
+                    out.append((job_id, run))
+        return out
+
+    def test_mypy_is_not_a_step_of_the_test_job(self, ci):
+        for step in ci["jobs"]["test"]["steps"]:
+            assert "mypy" not in str(step.get("run", "")), "mypy output would precede pytest"
+            assert "mypy" not in str(step.get("name", "")).lower()
+
+    def test_mypy_is_its_own_advisory_job_outside_the_gate(self, ci):
+        job = ci["jobs"]["mypy"]
+        assert job.get("continue-on-error") is True
+        assert any("mypy pyrite/" in str(s.get("run", "")) for s in job["steps"])
+        assert "mypy" not in ci["jobs"]["gate"]["needs"]
+
+    def test_the_mypy_job_runs_the_ratchet_not_bare_mypy(self, ci):
+        runs = [str(s.get("run", "")) for s in ci["jobs"]["mypy"]["steps"]]
+        assert any("scripts/mypy_ratchet.py" in r for r in runs)
+        # a bare `mypy pyrite/` step would be red on every PR again (#885)
+        for r in runs:
+            if "mypy pyrite/" in r:
+                assert "||" in r or "mypy_ratchet" in r
+        assert (REPO / ".mypy-baseline.json").exists()
+
+    def test_every_gating_pytest_line_records_durations_and_junit(self, ci):
+        runs = self._gating_pytest_runs(ci)
+        assert {j for j, _ in runs} == {"test", "smoke"}
+        for job_id, run in runs:
+            assert "--durations=25" in run and "--durations-min=1.0" in run, job_id
+            assert "junit_family=xunit1" in run and "--junitxml=" in run, job_id
+            assert "--disable-warnings" in run, f"{job_id}: warnings belong after the failure"
+
+    def test_the_test_job_keeps_the_deprecation_escalation(self, ci):
+        run = "\n".join(str(s.get("run", "")) for s in ci["jobs"]["test"]["steps"])
+        assert "error::DeprecationWarning:pyrite" in run
+
+    @pytest.mark.parametrize("job_id", ["test", "smoke"])
+    def test_the_junit_is_uploaded_for_thirty_days_even_when_red(self, ci, job_id):
+        ups = [
+            s
+            for s in ci["jobs"][job_id]["steps"]
+            if str(s.get("uses", "")).startswith("actions/upload-artifact")
+            and "junit" in str(s.get("with", {}).get("name", ""))
+        ]
+        assert len(ups) == 1, job_id
+        up = ups[0]
+        assert up["with"]["retention-days"] == 30
+        assert up["with"]["if-no-files-found"] == "ignore"  # died before pytest wrote it
+        assert "!cancelled()" in str(up["if"])
+
+    def test_gate_changes_kb_and_frontend_keep_their_names_and_gate_aggregates_the_shards(self, ci):
+        # `shard-report` (tests Q2) is the shards' union proof; the shard legs are
+        # `test (<py>, <k>)` and are aggregated by `gate`, never required by name.
+        assert ci["jobs"]["gate"]["needs"] == ["changes", "kb", "test", "shard-report", "frontend"]
+        assert "name" not in ci["jobs"]["test"], "`test (<python>)` is the matrix leg's name"
+        assert "name" not in ci["jobs"]["gate"], "`gate` is looked up by exact name"
+
+    def test_the_slowest_table_reads_a_junit_report(self, tmp_path):
+        import subprocess
+        import sys
+
+        xml = tmp_path / "j.xml"
+        xml.write_text(
+            '<testsuites><testsuite><testcase classname="t.a" name="fast" time="0.1"/>'
+            '<testcase classname="t.a" name="slow" time="9.5"/></testsuite></testsuites>'
+        )
+        script = REPO / "scripts" / "junit_slowest.py"
+        out = subprocess.run(
+            [sys.executable, str(script), str(xml), "x"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        ).stdout
+        assert out.index("slow") < out.index("fast") and "9.50" in out
+        missing = subprocess.run(
+            [sys.executable, str(script), str(tmp_path / "none.xml")],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert missing.returncode == 0 and "no junit report" in missing.stdout
+
+
+class TestTheTestJobIsShardedAndProvesItRanEverything:
+    """Tests Q2 scope addition: `test (3.12)` took 13 min (Sep 23) and 18-21
+    now; the suite doubled and the time followed the count. Each interpreter's
+    run is 3 parallel pytest-split shards, balanced by `.test_durations`.
+    """
+
+    SHARDS = 3
+
+    def test_a_red_shard_does_not_cancel_its_siblings(self, ci):
+        # every leg records its timings; gate still fails on any red leg
+        assert ci["jobs"]["test"]["strategy"]["fail-fast"] is False
+
+    def test_the_test_job_is_a_shard_matrix_under_every_interpreter(self, ci):
+        matrix = ci["jobs"]["test"]["strategy"]["matrix"]
+        assert matrix["shard"] == list(range(1, self.SHARDS + 1))
+        assert "python-version" in matrix
+
+    def test_the_pytest_line_takes_its_shard_and_falls_back_to_an_even_split(self, ci):
+        run = next(
+            str(s["run"])
+            for s in ci["jobs"]["test"]["steps"]
+            if "pytest -n auto" in str(s.get("run", ""))
+        )
+        assert f"--splits {self.SHARDS}" in run
+        assert "--group ${{ matrix.shard }}" in run
+        assert "--durations-path .test_durations" in run
+        assert "--store-durations" in run  # the timings the next balance is made from
+
+    def test_a_missing_durations_file_is_not_a_failure_or_a_dropped_test(self, tmp_path):
+        # pytest-split with no usable durations splits evenly by count; the
+        # three groups together are the whole collection.
+        import subprocess
+        import sys
+
+        (tmp_path / "test_x.py").write_text(
+            "import pytest\n@pytest.mark.parametrize('n', range(10))\ndef test_n(n): pass\n"
+        )
+        ran = []
+        for group in (1, 2, 3):
+            out = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    str(tmp_path / "test_x.py"),
+                    "-p",
+                    "no:cacheprovider",
+                    "--splits",
+                    "3",
+                    "--group",
+                    str(group),
+                    "--durations-path",
+                    str(tmp_path / "missing.json"),
+                    "-v",
+                ],
+                capture_output=True,
+                text=True,
+                cwd=tmp_path,
+                timeout=120,
+            ).stdout
+            ran += [ln.split()[0] for ln in out.splitlines() if " PASSED" in ln]
+        assert len(ran) == 10 and len(set(ran)) == 10
+
+    def test_the_lint_and_pr_hygiene_steps_run_once_per_interpreter(self, ci):
+        for step in ci["jobs"]["test"]["steps"]:
+            name = str(step.get("name", ""))
+            if name.startswith(("Lint with ruff", "Check for circular", "Validate KB")):
+                assert "matrix.shard == 1" in str(step["if"]), name
+
+    def test_shard_report_is_part_of_the_gate_and_runs_after_the_shards(self, ci):
+        job = ci["jobs"]["shard-report"]
+        assert {"test", "collect"} <= set(job["needs"])
+        assert "shard-report" in ci["jobs"]["gate"]["needs"]
+        # The proof cannot be switched off or narrowed by a later edit:
+        step = next(
+            s for s in job["steps"] if "check_shard_union.py check" in str(s.get("run", ""))
+        )
+        assert "--shards 3" in step["run"]
+        assert "|| true" not in step["run"], "a swallowed exit status is no proof"
+        assert "continue-on-error" not in step and "continue-on-error" not in job
+        assert str(step["if"]).strip() == "${{ needs.test.result == 'success' }}"
+        assert str(job["if"]).strip() == "${{ !cancelled() && needs.test.result != 'skipped' }}"
+
+    def test_the_collection_count_uses_the_shards_selection(self, ci):
+        run = "\n".join(str(s.get("run", "")) for s in ci["jobs"]["collect"]["steps"])
+        assert "not slow and not e2e and not experimental" in run
+        assert "--splits" not in run  # the unsplit collection
+
+    def test_the_durations_file_is_committed_gzip_json_under_the_size_limit(self):
+        import gzip
+        import json
+
+        path = REPO / ".test_durations.gz"
+        assert path.exists() and path.stat().st_size < 500 * 1024
+        data = json.loads(gzip.open(path, "rt").read())
+        assert data and all(isinstance(v, (int, float)) for v in data.values())
+
+    def test_the_shards_gunzip_it_and_survive_its_absence(self, ci):
+        run = next(
+            str(s["run"])
+            for s in ci["jobs"]["test"]["steps"]
+            if "pytest -n auto" in str(s.get("run", ""))
+        )
+        assert "gunzip -c .test_durations.gz > .test_durations" in run
+        assert "|| rm -f .test_durations" in run, "a bad file must fall back to an even split"
+
+    def test_every_nested_job_a_required_check_could_name_is_unchanged(self, ci):
+        for job in ("gate", "kb", "frontend", "changes"):
+            assert "name" not in ci["jobs"][job] or ci["jobs"][job]["name"] == job
+
+
+class TestGitAttributes:
+    def test_gitattributes_normalizes_text_to_lf(self):
+        path = REPO / ".gitattributes"
+        assert path.exists(), ".gitattributes must exist at repo root"
+        content = path.read_text(encoding="utf-8")
+        assert "* text=auto eol=lf" in content

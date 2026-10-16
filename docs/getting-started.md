@@ -123,8 +123,14 @@ pyrite search "mathematician" -k my-research --type person
 
 **Writes never wait on it.** `auto_embed` (on by default) promises that an entry *will be* embedded, not that it is embedded by the time the write returns (ADR-0035): a `pyrite create` or a `POST /api/entries` records the entry, makes it keyword-searchable immediately, and notes the embedding as owed. So on a brand-new KB, a semantic search issued straight after a write may not find that entry yet. Settle the debt — and trigger the download — whenever you like:
 
+<!-- runner: expect-exit 0 1 -->
 ```bash
 pyrite index embed                 # embed everything not yet embedded
+```
+
+`pyrite index embed` exits `0` when every entry is embedded. If the model cannot be loaded (no network on the first run, say), it prints `Errors: N`, says the entries are still owed, and exits `1` when none could be embedded (`3` when some were and some were not): what you asked for did not happen. Run it again once the model is reachable. The tutorial's test run is offline, so it sees the `1`; on a machine with the model cached it sees `0`, and the runner accepts either.
+
+```bash
 pyrite index sync                  # incremental index update, then embed
 ```
 
@@ -135,7 +141,7 @@ pyrite search "early computer science pioneers" -k my-research --mode semantic
 ```
 <!-- runner: expect-text pyrite index embed -->
 
-With the embeddings built, that finds Ada Lovelace. Until they are, the search prints `warning: semantic leg skipped ... run pyrite index embed` and returns nothing. The tutorial's test run is offline, so it sees that warning. Without the `semantic` extra the warning says instead that sentence-transformers is not installed and suggests `pip install pyrite[semantic]`; there is no PyPI wheel yet, so install it the way you installed Pyrite: `pip install -e ".[semantic]"` in a clone, or `pyrite[server,cli,semantic] @ git+...` from a release tag (see the [README](../README.md#install)).
+With the embeddings built, that finds Ada Lovelace. Until they are, the search prints `warning: semantic leg skipped ... run pyrite index embed` and returns nothing. The tutorial's test run is offline, so it sees that warning, too. Without the `semantic` extra the warning says instead that sentence-transformers is not installed and suggests `pip install pyrite[semantic]`; there is no PyPI wheel yet, so install it the way you installed Pyrite: `pip install -e ".[semantic]"` in a clone, or `pyrite[server,cli,semantic] @ git+...` from a release tag (see the [README](../README.md#install)).
 
 **Hybrid mode** combines both, and still answers from the keyword leg while the embeddings are missing:
 
@@ -190,8 +196,10 @@ do this safely:
   duplicate key, is read-only or hard-linked, or changed while the command ran;
 - the `pyrite` entry's arguments do not begin with `mcp`, or the entry is not
   a server entry at all (`--force` discards it and writes the default entry);
-- the entry's own arguments, with this install's path, would not start
-  (it runs them with `--help` first; an old `-t X` is rewritten to `--tier X`);
+- the entry's own arguments, with this install's path, would not start a
+  server: an option `pyrite mcp` does not have, a stray argument, a tier that
+  does not exist (it has this install's `pyrite mcp` read them first; an old
+  `-t X` is rewritten to `--tier X`);
 - in Claude Code's user scope, the entry has `env` or other keys and its path
   must change. Claude Code can only remove and re-add an entry, which would
   drop them, so the report gives the commands to run yourself;
@@ -199,6 +207,68 @@ do this safely:
 
 `--force` means one thing: discard the existing `pyrite` entry and write the
 default one. The report names what was discarded.
+
+**Reading the report.** Each client has a `status`:
+
+| `status` | What it means |
+|---|---|
+| `created`, `changed` | The entry is there. For Claude Code, the command read `~/.claude.json` again after `claude mcp` ran and saw it; an exit code alone is not taken as success. For a file Pyrite writes itself (Claude Desktop, `--project`, `--config`) it replaced the file in one step and did not read it back. |
+| `unchanged` | The entry already pointed here. Nothing was written. |
+| `stopped` | Nothing in that client was changed. `error_code`, `error` and `suggestion` say why. |
+| `failed` | Claude Code only: `claude mcp` was run, and the file as last read does not hold the entry as it was or as you asked (or, for `INTERNAL_ERROR`, a bug followed a call and the file was not read again). |
+
+A `stopped` or `failed` client may carry `by_hand`: commands to run yourself,
+all of them, in order. `suggestion` says what they do. They are built from
+what the file held when it was last read, so each one works on the state the
+report describes. `removed` is the entry a `failed` run took out of an
+existing entry's place (a `failed` client with `INTERNAL_ERROR` has none).
+`entry` is the entry as the file holds it: on `created`, `changed` and
+`unchanged` the entry that is there, on a `stopped` client that needs a hand
+edit the entry that is there, and on a `failed` client the other entry in the
+way, when it is neither the old one nor the new one. A `failed` client looks
+like this:
+
+<!-- mcp-setup: a failed client -->
+```json
+{
+  "client": "claude-code",
+  "scope": "user",
+  "label": "Claude Code (user scope, via `claude mcp`)",
+  "location": "/home/you/.claude.json",
+  "notes": [],
+  "status": "failed",
+  "error_code": "CLIENT_COMMAND_FAILED",
+  "error": "`claude mcp add` failed: <what claude printed>; restoring the previous entry also failed: <what claude printed>. The previous 'pyrite' entry is not back; `removed` is what it held",
+  "suggestion": "to put the previous entry back, run the command in by_hand; or re-run `pyrite mcp-setup` to add this install's entry (the write tier and no extra arguments, not what the previous entry held)",
+  "removed": {
+    "command": "/old/venv/bin/pyrite",
+    "args": ["mcp", "--tier", "admin"]
+  },
+  "by_hand": [
+    "claude mcp add -s user pyrite -- /old/venv/bin/pyrite mcp --tier admin"
+  ]
+}
+```
+
+Here the old entry was removed, `claude mcp add` then failed, and adding the
+old entry back failed too. The command in `by_hand` puts it back; running
+`pyrite mcp-setup` again adds this install's entry instead. Env values are
+never printed: where an entry has `env`, a command shows `KEY=<its value>` and
+the suggestion says to fill it in.
+
+`claude` is never run on a `~/.claude.json` it cannot read, and the report
+then gives no `claude` command either: Claude Code replaces an empty or
+unparseable `~/.claude.json` with fresh state on any `claude mcp` call. The
+report says to restore the file and re-run.
+
+**Other Claude Code scopes.** `mcp-setup` writes the user scope (or
+`./.mcp.json` with `--project`). If Claude Code has another `pyrite` entry
+that differs from the user-scope one, the report lists it under
+`other_scopes` and in a note, and does not change it. That is a local-scope
+entry, which `claude mcp add` without `-s user` writes for one project, or an
+entry in the current directory's `./.mcp.json`. A local-scope entry takes
+precedence in its directory, so sessions started there keep using it;
+`claude mcp get pyrite`, run there, shows which entry is in use.
 
 A config file that a client wrote comes back byte for byte outside the
 `pyrite` entry. A file you formatted by hand keeps every value and its indent,
@@ -270,6 +340,7 @@ An install from a release tag has no web UI yet: the built frontend is not packa
 
 ## Next Steps
 
+- [Next: Pyrite in 20 minutes](tutorials/pyrite-in-20-minutes.md) — a hands-on first tutorial
 - [Writing a Plugin](tutorials/plugin-writing.md) — extend Pyrite with custom entry types, MCP tools, and CLI commands
 - [Awesome Plugins](plugins.md) — community extensions
 - [Pin your entry ids before upgrading](pinning-entry-ids.md) — upgrading a KB with files that have no `id:` line

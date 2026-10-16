@@ -351,7 +351,11 @@ def test_patched_in_a_fixture(patched):
 
 def git(repo: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", "-C", str(repo), *args], check=True, capture_output=True, text=True
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
     ).stdout.strip()
 
 
@@ -756,7 +760,7 @@ def test_only_its_own_stale_trees_are_pruned(repo: Path, tmp_path: Path) -> None
     # moved checkout) is not this tool's to forget.
     other = tmp_path / "elsewhere" / "wt"
     git(repo, "worktree", "add", "-q", "--detach", str(other))
-    subprocess.run(["rm", "-rf", str(other)], check=True)
+    subprocess.run(["rm", "-rf", str(other)], check=True, timeout=120)
     (repo / "pyrite" / "__init__.py").write_text(FIXED)
     (repo / "tests" / "test_new.py").write_text(
         "from pyrite import add\n\n\ndef test_new():\n    assert add(2, 2) == 4\n"
@@ -929,7 +933,7 @@ def test_a_killed_run_leaves_the_developers_tree_alone(repo: Path, tmp_path: Pat
     assert len(stale) == 1 and len(worktrees(repo)) == 2, (stale, worktrees(repo))
 
     # The OS clears $TMPDIR; the next run drops the registration left behind.
-    subprocess.run(["rm", "-rf", str(stale[0])], check=True)
+    subprocess.run(["rm", "-rf", str(stale[0])], check=True, timeout=120)
     flag.unlink()
     result, summary = run_vr(repo, tmp_path, env=env)
     assert result.returncode == 0, (result.stdout, result.stderr)
@@ -1035,7 +1039,9 @@ class TestTheVerifyRedJob:
 
     @pytest.mark.control(reason="kept from the old job")
     def test_it_is_not_a_gate(self, ci):
-        assert ci["jobs"]["gate"]["needs"] == ["changes", "kb", "test", "frontend"]
+        # `shard-report` (tests Q2) joined the gate: it proves the test shards'
+        # union is the full collection. verify-red is still not in it.
+        assert ci["jobs"]["gate"]["needs"] == ["changes", "kb", "test", "shard-report", "frontend"]
 
     @pytest.mark.control(reason="kept from the old job")
     def test_it_is_read_only(self, ci):
@@ -1084,7 +1090,7 @@ class TestDiffCoverage:
         assert "--cov=pyrite" in run
         # [tool.coverage.report] fail_under would otherwise fail the suite (and gate).
         assert "--cov-fail-under=0" in run
-        assert "--cov-report=xml" in run
+        assert "--cov-report=xml" in run  # one file per shard; shard-report merges them
 
     def test_only_the_312_pr_leg_pays_for_it(self, ci):
         step = next(s for s in self._test_job(ci)["steps"] if "--cov=pyrite" in s.get("run", ""))
@@ -1093,8 +1099,10 @@ class TestDiffCoverage:
         assert "github.event_name == 'pull_request'" in run
 
     def test_diff_cover_is_advisory(self, ci):
-        steps = self._test_job(ci)["steps"]
-        step = next(s for s in steps if "diff-cover" in s.get("run", ""))
+        # Sharded (tests Q2): the shards each write coverage; `shard-report`
+        # runs diff-cover over the three files.
+        steps = ci["jobs"]["shard-report"]["steps"]
+        step = next(s for s in steps if "diff-cover coverage" in s.get("run", ""))
         assert "--fail-under=80" in step["run"]
         assert "--compare-branch" in step["run"]
         assert "github.event.pull_request.base.sha" in step["run"]
@@ -1119,7 +1127,7 @@ class TestDiffCoverage:
 
 
 # ---------------------------------------------------------------------------
-# Who runs it: the worker once, CI always; the conductor reads CI.
+# Who runs it: the contributor once, CI always; the reviewer reads CI.
 # ---------------------------------------------------------------------------
 
 
@@ -1127,16 +1135,16 @@ def _words(path: Path) -> str:
     return " ".join(path.read_text().split())
 
 
-def test_the_conductor_reads_the_ci_result_and_does_not_rerun_it():
-    review = _words(REPO / ".claude" / "skills" / "pyrite-conductor" / "review.md")
-    assert "read the `verify-red` job's summary line" in review
-    assert "do not re-run it locally" in review
-    # The job runs the PR's own copy: a PR that changes it cannot vouch for itself.
-    assert "the PR itself touches `scripts/verify*red*` or the `verify-red` job" in review
-    # ...and the manual check runs dev's copy from the PR's worktree, never the PR's own copy.
-    assert "git show origin/dev:scripts/$f" in review
-    assert "The manual check runs **dev's** copy, never the PR's" in review
-    assert "0 red, or only import-only reds, goes back" in review
+def test_contributing_says_ci_runs_it_and_what_the_summary_line_means():
+    # The maintainer's review guidance left the repo with the loop skills; what
+    # a contributor can follow is CONTRIBUTING: CI's job runs the same check as
+    # the script, and the summary line's categories are defined there.
+    text = _words(REPO / "CONTRIBUTING.md")
+    assert "**`verify-red`** job" in text
+    assert "`scripts/verify-red.sh` runs the same check locally" in text
+    assert "verify-red: 3 red · 0 import-only · 1 unexpected pass · 0 n/a" in text
+    for category in ("*red*", "*import-only*", "*unexpected pass*", "*n/a*"):
+        assert category in text, category
 
 
 def test_the_worker_runs_it_once_and_pastes_the_line():

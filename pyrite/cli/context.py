@@ -4,6 +4,7 @@ import logging
 import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.exc import SQLAlchemyError
@@ -166,3 +167,47 @@ def get_config_with_registered_kbs(
             exc,
         )
     return config
+
+
+def require_input_file(path: Path | str, what: str = "File") -> Path:
+    """The path of a file the caller named as input, or the refusal for it.
+
+    One rule for every CLI input path (#846): a path that does not exist is
+    ``EntryNotFoundError`` (``NOT_FOUND``, as each site always said), and a
+    path that is a directory is ``ValidationError`` naming it -- before this
+    it reached ``read_text`` and left the body as ``IsADirectoryError``,
+    which the root reports as ``NO_OUTCOME``. Used by ``create`` and
+    ``update`` (``--body-file``), ``add`` and ``links bulk-create``.
+    """
+    from ..exceptions import EntryNotFoundError, ValidationError
+
+    p = Path(path)
+    if not p.exists():
+        raise EntryNotFoundError(f"{what} not found: {path}")
+    if p.is_dir():
+        raise ValidationError(f"{what} is a directory, not a file: {path}")
+    return p
+
+
+def input_file_or_exit(path: Path | str, what: str = "File", output_format: str = "rich") -> Path:
+    """:func:`require_input_file` for a command that renders its own errors.
+
+    The legacy commands (not yet on the ADR-0046 outcome contract) catch
+    nothing the root would render, so the refusal is printed here in the CLI's
+    error shape and the command exits 1 (#923).
+    """
+    from ..exceptions import PyriteError
+    from ..utils.errors import cli_error_from
+
+    try:
+        return require_input_file(path, what)
+    except PyriteError as exc:
+        # The CLI spells a missing path NOT_FOUND (the class says ENTRY_NOT_FOUND).
+        code = "NOT_FOUND" if exc.error_code == "ENTRY_NOT_FOUND" else None
+        cli_error_from(exc, output_format, error_code=code)
+        raise  # unreachable: cli_error_from always exits
+
+
+def read_input_file(path: Path | str, what: str = "File") -> str:
+    """The text of an input file, refused as :func:`require_input_file` says."""
+    return require_input_file(path, what).read_text(encoding="utf-8")

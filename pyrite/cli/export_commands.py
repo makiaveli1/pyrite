@@ -8,12 +8,47 @@ from rich.console import Console
 
 from ..cli.context import cli_context
 from ..services.access_policy import UNSCOPED
+from ..utils.errors import exit_unless_whole
 from ..utils.frontmatter import Frontmatter, split_frontmatter
 
 logger = logging.getLogger(__name__)
 console = Console()
 
 export_app = typer.Typer(help="Export KB entries to external formats")
+
+
+def _legacy_format_option():
+    """`--format`/`-f` named the export target until #873 gave `--format` to the
+    shared output option (ADR-0046). Kept one release as a hidden alias."""
+    return typer.Option(None, "--format", "-f", hidden=True)
+
+
+def _resolve_target(target: str | None, legacy_format: str | None, valid: tuple[str, ...]) -> str:
+    """The export target, from `--target` or its deprecated alias `--format`/`-f`.
+
+    Both given with different values is a usage error (exit 2); the old spelling
+    alone warns once on stderr (the deprecation pattern of #303). A value the
+    command cannot produce is a usage error too, before anything is written.
+    The first of ``valid`` is the default.
+    """
+    if legacy_format is not None and target is not None and target != legacy_format:
+        raise typer.BadParameter(
+            f"--target {target} and --format {legacy_format} disagree; "
+            "use --target only (--format is deprecated)."
+        )
+    for given in (target, legacy_format):
+        if given is not None and given not in valid:
+            raise typer.BadParameter(
+                f"unknown target {given!r}; valid targets: {', '.join(valid)}."
+            )
+    if legacy_format is None:
+        return target if target is not None else valid[0]
+    typer.echo(
+        "Warning: --format/-f on `pyrite export` is deprecated and will be removed in the "
+        f"next release; use --target {legacy_format}.",
+        err=True,
+    )
+    return legacy_format
 
 
 @export_app.command("collection")
@@ -31,9 +66,10 @@ def export_collection(
         0, "--depth", help="Link-following depth (0=no following, 1=direct links, etc.)"
     ),
     title: str = typer.Option(None, "--title", help="Title for the manifest document"),
-    format: str = typer.Option(
-        "notebooklm", "--format", "-f", help="Export format (currently: notebooklm)"
+    target: str = typer.Option(
+        None, "--target", help="Export target (currently: notebooklm; the default)"
     ),
+    legacy_format: str = _legacy_format_option(),
 ):
     """Export a collection of KB entries for NotebookLM.
 
@@ -51,6 +87,8 @@ def export_collection(
         # Bundle into fewer files for large collections
         pyrite export collection my-collection --bundle by-type
     """
+    _resolve_target(target, legacy_format, ("notebooklm",))
+
     from ..models.base import Entry
     from ..renderers.notebooklm import BundleStrategy, SourceMode
     from ..services.export_service import ExportService
@@ -82,6 +120,7 @@ def export_collection(
 
     with cli_context() as (config, db, svc):
         entries: list[Entry] = []
+        unreadable: list[object] = []  # matched, but could not be loaded for the export
 
         if collection_id.startswith("q:"):
             # Query mode — resolve entries via collection query DSL
@@ -99,6 +138,8 @@ def export_collection(
                 entry = _load_entry_from_result(result, svc, kb)
                 if entry:
                     entries.append(entry)
+                else:
+                    unreadable.append(result)
         else:
             # Collection ID mode — load collection, resolve its entries
             collection = svc.load_entry_from_disk(collection_id, kb or "")
@@ -123,6 +164,8 @@ def export_collection(
                     entry = _load_entry_from_result(result, svc, kb)
                     if entry:
                         entries.append(entry)
+                    else:
+                        unreadable.append(result)
             elif collection.folder_path:
                 # Folder-based: list entries in that folder
                 kb_config = config.get_kb(kb or "")
@@ -138,6 +181,7 @@ def export_collection(
                                     entries.append(entry)
                             except Exception as e:
                                 logger.warning("Could not load %s: %s", md_file, e)
+                                unreadable.append(md_file)
 
         # Follow links to depth N
         if depth > 0 and entries:
@@ -145,6 +189,7 @@ def export_collection(
 
         if not entries:
             console.print("[yellow]No entries to export.[/yellow]")
+            exit_unless_whole(len(unreadable), 0)  # matched but unloadable: nothing exported
             raise typer.Exit(0)
 
         # Export
@@ -161,13 +206,22 @@ def export_collection(
         console.print(f"  Files created: {result['files_created']}")
         console.print(f"  Manifest: {output / '_manifest.md'}")
         console.print(f"  Output: {output}")
+        if unreadable:
+            console.print(
+                f"[yellow]{len(unreadable)} matched entr(ies) could not be loaded "
+                f"and are not in the export.[/yellow]"
+            )
+        exit_unless_whole(len(unreadable), result["entries_exported"])
 
 
 @export_app.command("site")
 def export_site(
     kb: str = typer.Option(..., "-k", "--kb", help="Knowledge base name"),
     output: Path = typer.Option(Path("./site"), "-o", "--output", help="Output directory"),
-    format: str = typer.Option("quartz", "--format", "-f", help="Site format (currently: quartz)"),
+    target: str = typer.Option(
+        None, "--target", help="Site target (currently: quartz; the default)"
+    ),
+    legacy_format: str = _legacy_format_option(),
     exclude_types: str = typer.Option(
         None, "--exclude-types", help="Comma-separated entry types to exclude"
     ),
@@ -192,10 +246,7 @@ def export_site(
         pyrite export site -k my-kb -o ./my-site \\
             --exclude-types backlog_item,note --exclude-status draft,done
     """
-    if format != "quartz":
-        console.print(f"[red]Unknown site format: {format}[/red]")
-        console.print("Valid options: quartz")
-        raise typer.Exit(1)
+    _resolve_target(target, legacy_format, ("quartz",))
 
     from ..renderers.quartz import export_site as quartz_export
     from ..renderers.quartz import scaffold_quartz_project

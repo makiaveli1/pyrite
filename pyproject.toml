@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pyrite"
-version = "0.25.6"
+version = "0.25.8"
 description = "Knowledge-as-Code for you and your agents"
 readme = "README.md"
 license = {text = "MIT"}
@@ -91,6 +91,8 @@ dev = [
     "pytest-xdist==3.8.0",
     # Bounds every test (#766): a hung retry loop ended nothing for 2h on #752.
     "pytest-timeout==2.4.0",
+    # Splits the CI suite into balanced parallel shards (tests Q2); ci.yml `test`.
+    "pytest-split==0.11.0",
     # Diff coverage on the PR's 3.12 leg (advisory; see ci.yml's test job).
     "diff-cover==10.6.0",
     # Pinned exactly: tests/test_storage_invariants.py runs derandomized, and
@@ -126,6 +128,11 @@ python_files = ["test_*.py"]
 # Per-test ceiling in seconds (#766); TestEveryTestIsBounded pins it <= 600.
 # A test that needs longer is marked @pytest.mark.timeout(N) with a reason.
 timeout = 600
+# No `timeout_func_only`: the ceiling also covers fixture setup and teardown, so a
+# hanging fixture is killed too (tests/test_test_rules.py proves it).
+# A test still running after this many seconds dumps every thread's stack to
+# stderr, so a hang names its culprit (#372) even before the ceiling kills it.
+faulthandler_timeout = 300
 addopts = "-v --tb=short -m 'not slow and not e2e'"
 markers = [
     "integration: tests requiring full environment setup (DB, indexing, network)",
@@ -153,6 +160,9 @@ markers = [
     # verify-red (scripts/verify_red_ci.py): a test the PR adds on purpose to
     # pass without the fix too (a "still works" guard), so it is not warned about.
     # It must say why: reason=... or the test's docstring; a bare marker is rejected.
+    # The root conftest hashes passwords at bcrypt cost 4 in tests (tests-t2a); a test
+    # that asserts the stored hash's format or cost opts out and sees production cost 12.
+    "production_bcrypt_cost: opt out of the cheap test bcrypt cost; the test sees the production cost",
     "control(reason): a deliberate negative control; verify-red expects it to pass without the fix",
 ]
 

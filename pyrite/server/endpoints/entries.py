@@ -18,7 +18,7 @@ from ...exceptions import (
 from ...services.access_policy import KB, Action, AnyKB, ReadScope
 from ...services.block_service import BlockService
 from ...services.kb_service import KBService
-from ...services.read_shaping import parse_fields_param, project_fields
+from ...services.read_shaping import IDENTITY_FIELDS, parse_fields_param, project_fields
 from ..api import (
     get_block_service,
     get_config,
@@ -413,11 +413,18 @@ def batch_read_entries(
         ids = [(eid, kb) for eid, kb in ids if scope.permits(kb)]
     results = svc.get_entries(ids)
 
-    if fields_param:
+    # `[]` is no projection. A non-empty list that cleans to nothing (`[""]`,
+    # `[" "]`) is still a projection, as it was before the list went through
+    # parse_fields_param: the identity pair only. The body's list is not split
+    # on commas, unlike `?fields=`: `["a,b"]` names one field.
+    fields_list = parse_fields_param(fields_param)
+    if fields_param and not fields_list:
+        fields_list = list(IDENTITY_FIELDS)
+    if fields_list:
         # Same rule as every other read surface (#193). found_ids below reads
         # the identity pair, and dropping it is what made `found` and
         # `not_found` disagree (#134).
-        results = [project_fields(record, fields_param) for record in results]
+        results = [project_fields(record, fields_list) for record in results]
 
     found_ids = {(r["id"], r["kb_name"]) for r in results}
     requested = [(e["entry_id"], e["kb_name"]) for e in entries_spec]
@@ -426,7 +433,7 @@ def batch_read_entries(
     ]
 
     resp_data = {"entries": results, "found": len(results), "not_found": not_found}
-    neg = negotiate_response(request, resp_data)
+    neg = negotiate_response(request, resp_data, fields=fields_list)
     if neg is not None:
         return neg
     return resp_data
@@ -737,7 +744,7 @@ def get_entry(
     fields_list = parse_fields_param(fields)
     if fields_list:
         result = project_fields(result, fields_list)
-        neg = negotiate_response(request, result)
+        neg = negotiate_response(request, result, fields=fields_list, single_entry=True)
         if neg is not None:
             return neg
         return JSONResponse(content=result)

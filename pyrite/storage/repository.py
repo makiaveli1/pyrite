@@ -6,6 +6,7 @@ Each KB is a directory of markdown files with YAML frontmatter.
 """
 
 import glob
+import io
 import logging
 import os
 from collections.abc import Iterator
@@ -27,6 +28,15 @@ from ..utils.frontmatter import Frontmatter, split_frontmatter
 from ..utils.yaml import load_yaml, load_yaml_file
 
 logger = logging.getLogger(__name__)
+
+
+def _event_fallback(file_path: Path, text: str | None) -> Entry:
+    """``EventEntry.load``, from ``text`` when the caller already read it."""
+    if text is None:
+        return EventEntry.load(file_path)
+    entry = EventEntry.from_markdown(text)
+    entry.file_path = file_path
+    return entry
 
 
 class KBRepository:
@@ -52,29 +62,22 @@ class KBRepository:
         # to the correct type based on entry_type field
         return Entry
 
-    def _load_entry(self, file_path: Path) -> Entry:
-        """Load an entry from a file, dispatching to the correct type."""
+    def _load_entry(self, file_path: Path, text: str | None = None) -> Entry:
+        """Load an entry from a file, dispatching to the correct type.
+
+        ``text``: the file's text, already read (``load_entry_from_bytes``);
+        read here when None.
+        """
         # Try to load with type-aware parsing
         try:
             # Read frontmatter to determine type
-            text = file_path.read_text(encoding="utf-8")
+            if text is None:
+                text = file_path.read_text(encoding="utf-8")
             split = split_frontmatter(text)
             if isinstance(split, Frontmatter):
                 fm = load_yaml(split.text)
                 if fm and isinstance(fm, dict):
                     body = split.body
-                    # Defensive: strip duplicated frontmatter fields from body start
-                    # (e.g., "type: timeline_event" leaked into body by migration error)
-                    if body and ":" in body.split("\n", 1)[0]:
-                        first_line = body.split("\n", 1)[0].strip()
-                        key = first_line.split(":", 1)[0].strip()
-                        if key in fm:
-                            logger.debug(
-                                "Stripped duplicated frontmatter field '%s' from body of %s",
-                                key,
-                                file_path,
-                            )
-                            body = body.split("\n", 1)[1].strip() if "\n" in body else ""
                     fm = self._maybe_migrate(fm)
                     # `fm` is the entry's frontmatter and nothing else. It
                     # used to get `body` and `file_path` injected here, but
@@ -95,7 +98,7 @@ class KBRepository:
                     return entry
 
             # Fallback: try EventEntry.load for backward compat
-            return EventEntry.load(file_path)
+            return _event_fallback(file_path, text)
         except FrontmatterError:
             # Malformed YAML: the EventEntry fallback re-parses the same bytes
             # and would fail identically, so re-raise rather than retry.
@@ -113,7 +116,7 @@ class KBRepository:
                 file_path,
                 e,
             )
-            return EventEntry.load(file_path)
+            return _event_fallback(file_path, text)
 
     def _maybe_migrate(self, fm: dict) -> dict:
         """Apply pending schema migrations to frontmatter if needed."""
@@ -295,13 +298,25 @@ class KBRepository:
         answers this (ADR-0038 decision 1) -- with this KB's schema
         migrations applied first, as ``_load_entry`` applies them.
         """
+        return self.read_id(file_path)[0]
+
+    def read_id(self, file_path: Path) -> tuple[str | None, str | None]:
+        """``id_of_file`` with the reason: ``(id, None)``, or ``(None, why)``
+        where ``why`` is the loader's own message (``title must be a string,
+        got a list``), or None when the file simply holds no entry."""
         try:
             if file_path.name == "__collection.yaml":
-                return self._load_collection(file_path).id or None
-            return read_entry_id(file_path.read_text(encoding="utf-8"), migrate=self._maybe_migrate)
+                return self._load_collection(file_path).id or None, None
+            return (
+                read_entry_id(file_path.read_text(encoding="utf-8"), migrate=self._maybe_migrate),
+                None,
+            )
         except Exception as e:
             logger.warning("Skipping unreadable file during id lookup: %s (%s)", file_path, e)
-            return None
+            # One line, KB-relative: a ruamel message spans lines and may name
+            # an absolute path, and this text is shown to the user.
+            why = (str(e).splitlines() or [""])[0].replace(f"{self.path}/", "")
+            return None, why or type(e).__name__
 
     def find_file(self, entry_id: str) -> Path | None:
         """The file that holds ``entry_id``, or None (ADR-0038 I8).
@@ -728,6 +743,25 @@ class KBRepository:
             if any(part.startswith(".") for part in yaml_file.parts):
                 continue
             yield yaml_file
+
+    def load_entry_from_bytes(self, file_path: Path, raw: bytes) -> Entry:
+        """``load_entry_from_file`` of ``raw``, the file's bytes as already read.
+
+        For a reader that must name the bytes it parsed (a single-entry read
+        and its ``content_hash``, ADR-0042 decision 9): the text is decoded as
+        ``read_text`` decodes it -- UTF-8, universal newlines -- so the entry
+        is the one a read of the file would give. Raises on parse failure.
+        """
+        text = io.TextIOWrapper(io.BytesIO(raw), encoding="utf-8").read()
+        if file_path.name == "__collection.yaml":
+            data = load_yaml(text)
+            folder_path = str(file_path.parent.relative_to(self.path))
+            entry: Entry = CollectionEntry.from_collection_yaml(data, folder_path)
+        else:
+            entry = self._load_entry(file_path, text)
+        entry.kb_name = self.name
+        entry.file_path = file_path
+        return entry
 
     def load_entry_from_file(self, file_path: Path) -> Entry:
         """Load and parse a single entry from a file path.

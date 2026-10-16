@@ -30,6 +30,8 @@ from ..exceptions import (
     QueryTooLongError,
     StorageError,
     ValidationError,
+    public_text,
+    refusal_fields,
 )
 from ..services.access_policy import ROLES, named_kb
 from ..services.body_bounds import (
@@ -40,7 +42,7 @@ from ..services.body_bounds import (
 )
 from ..services.export_service import ExportService
 from ..services.graph_service import GraphService
-from ..services.kb_service import KBService
+from ..services.kb_service import KBService, check_link_spec
 from ..services.read_shaping import project_fields
 from ..storage.database import PyriteDB
 from ..storage.index import IndexManager
@@ -131,7 +133,20 @@ _LEGACY_OWN_ERROR_CODE: dict[str, str] = {
 #: job -- so there is no old MCP behaviour to disagree with, and no
 #: ``legacy_error_code`` should be reported for them even though they are
 #: not explicitly in the tables above either.
-_NEW_IN_THIS_THEME = frozenset({"AccessDenied", "NotAuthenticated", "Forbidden"})
+_NEW_IN_THIS_THEME = frozenset(
+    {
+        "AccessDenied",
+        "NotAuthenticated",
+        "Forbidden",
+        "AmbiguousEntryError",
+        # #795: QA refusals no MCP surface raised before, so there is no old
+        # code to carry either.
+        "InvalidQATierError",
+        "AINotConfiguredError",
+        "EvaluationFailedError",
+        "KBUnreadableError",
+    }
+)
 
 
 def _legacy_mcp_code(exc: PyriteError) -> str | None:
@@ -173,11 +188,21 @@ def _safe_message(exc: Exception) -> str:
     ``exc`` is not always a ``PyriteError`` -- ``public_message`` is looked
     up with ``getattr``, not assumed present.
     """
-    public_message = getattr(exc, "public_message", None)
-    if public_message is not None:
-        logger.warning("%s", exc)
-        return public_message
-    return str(exc)
+    return public_text(exc, log=logger)
+
+
+def _boolean_arg(args: dict[str, Any], name: str, default: bool = False) -> bool | None:
+    """A boolean tool argument; ``None`` when it is neither a bool nor "true"/"false".
+
+    A client that sends the string "false" must not get the truthy reading
+    ``bool("false")`` gives (#200).
+    """
+    value = args.get(name, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    return None
 
 
 def _error(
@@ -197,7 +222,7 @@ def _error(
     return r
 
 
-def _refusal(exc: PyriteError) -> dict:
+def _refusal(exc: PyriteError, *, already_logged: bool = False) -> dict:
     """Map a service refusal to the MCP envelope.
 
     The code is the exception class's own (``exc.error_code`` -- every
@@ -231,7 +256,9 @@ def _refusal(exc: PyriteError) -> dict:
     # `public_message` class attribute because its own str() names a real
     # filesystem path (BrandingInvalidError; the REST side's #377 pattern,
     # #445's cold read).
-    message = exc.public_message or str(exc)
+    # `already_logged`: the dispatchers log a StorageError at ERROR with its
+    # traceback (#431) before calling this; the cause is logged once (#848).
+    message = public_text(exc, already_logged=already_logged, log=logger)
     err = _error(
         code,
         message,
@@ -239,6 +266,9 @@ def _refusal(exc: PyriteError) -> dict:
         retryable=retryable,
         legacy_error_code=legacy_code,
     )
+    # A refusal's public extras (AMBIGUOUS's candidate_kbs, #528), mapped
+    # once for every class from REFUSAL_FIELDS in pyrite.exceptions.
+    err.update(refusal_fields(exc))
     declared = getattr(exc, "declared_types", None)
     if declared is not None:
         err["declared_types"] = declared
@@ -248,6 +278,22 @@ def _refusal(exc: PyriteError) -> dict:
             "or pass allow_undeclared=true to override.",
         )
     return err
+
+
+def _protocol_refusal(err: dict) -> Exception:
+    """A refusal from a prompt or resource, as a JSON-RPC error.
+
+    `prompts/get` and `resources/read` have no result shape for a refusal, so
+    the envelope ``_refusal``/``_error`` built (``error_code``, ``suggestion``,
+    ``retryable``, and ``REFUSAL_FIELDS`` such as ``candidate_kbs``) travels
+    whole in the JSON-RPC error's ``data``, with ``error`` as its message. A
+    bare ``ValueError`` here sent the message alone (#528 fix round 1).
+    Tools answer the same envelope as their result instead.
+    """
+    from mcp.shared.exceptions import McpError
+    from mcp.types import INVALID_PARAMS, ErrorData
+
+    return McpError(ErrorData(code=INVALID_PARAMS, message=err["error"], data=err))
 
 
 MAX_TIMELINE_EVENTS = 50
@@ -281,7 +327,17 @@ _PIPELINE_WRITE_TOOLS = frozenset({"kb_create", "kb_update", "kb_bulk_create"})
 #
 # The gate pins this set. Adding a name here without adding it there (or
 # vice versa) fails `test_the_chokepoint_checks_every_name_this_file_claims`.
-KB_ARGUMENT_NAMES = ("kb_name", "kb", "source_kb", "target_kb", "center_kb", "kb_names")
+KB_ARGUMENT_NAMES = (
+    "kb_name",
+    "kb",
+    "source_kb",
+    "target_kb",
+    "center_kb",
+    "kb_names",
+    # find_connections names a KB per entry (#528)
+    "kb_a",
+    "kb_b",
+)
 
 # The keyword by which `_dispatch_tool` hands the readable set to a handler
 # that spans KBs. A handler opts in by declaring it; handlers that do not --
@@ -402,16 +458,16 @@ class PyriteMCPServer:
         self.db = PyriteDB(self.config.settings.index_path)
         self.db.merge_registered_kbs(self.config)
         self.index_mgr = IndexManager(self.db, self.config)
-        self.svc = KBService(self.config, self.db)
-        self.graph_svc = GraphService(self.db)
-        self.export_svc = ExportService(self.config, self.db)
-        self._index_worker = None  # Lazy-init
 
         # KB registry (seeded from config on init)
         from ..services.kb_registry_service import KBRegistryService
 
         self.registry = KBRegistryService(self.config, self.db, self.index_mgr)
         self.registry.seed_from_config()
+        self.svc = KBService(self.config, self.db, registry=self.registry)
+        self.graph_svc = GraphService(self.db)
+        self.export_svc = ExportService(self.config, self.db)
+        self._index_worker = None  # Lazy-init
 
         # Rate limiter and tool→tier map
         self.rate_limiter = MCPRateLimiter(self.config.settings)
@@ -604,7 +660,9 @@ class PyriteMCPServer:
         # docstring, "what a search response owes its caller" (#56).
         warnings: list[str] = []
         try:
-            results = self.search_svc.search(
+            # The one assembler (#668): rows, verdict and warnings. Every key
+            # but `results` goes into the payload as it is.
+            response = self.search_svc.search_response(
                 query=query,
                 kb_name=args.get("kb_name"),
                 kb_names=None if args.get("kb_name") else readable_kbs,
@@ -635,6 +693,7 @@ class PyriteMCPServer:
                 ),
                 retryable=False,
             )
+        results = response.pop("results")
 
         if fields or include_body:
             # kb_search takes no body_limit, so every body it returns is
@@ -655,9 +714,8 @@ class PyriteMCPServer:
             "count": len(results),
             "has_more": len(results) == limit,
             "results": results,
+            **response,
         }
-        if warnings:
-            payload["warnings"] = warnings
         return payload
 
     def _kb_get(
@@ -665,11 +723,10 @@ class PyriteMCPServer:
     ) -> dict[str, Any]:
         """Get entry by ID.
 
-        With `kb_name` omitted, `KBService.get_entry` walks the KBs in
-        config order and returns the first hit -- so it is handed the
-        caller's readable set, and an entry in an unreadable KB is a plain
-        miss (naming the KB would reveal which private KB holds it) that
-        never hides a readable entry with the same id.
+        With `kb_name` omitted, `KBService.get_entry` considers only the
+        caller's readable KBs and refuses an ID found in more than one.
+        An entry in an unreadable KB neither answers nor becomes an
+        ambiguity candidate.
         """
         entry_id = args.get("entry_id")
         kb_name = args.get("kb_name")
@@ -677,17 +734,23 @@ class PyriteMCPServer:
         body_offset = args.get("body_offset", 0)
         body_limit = args.get("body_limit")
 
+        # The same lookup `get_entry` reads through (shortname mapping, then
+        # config and the index's registry), not the startup config alone: a
+        # KB `pyrite kb add` registered while this server runs is served by
+        # kb_list_entries and kb_read_body, so it must not be KB_NOT_FOUND here.
+        named = named_kb(kb_name)
+        if named and self.svc.get_kb(self.config.kb_name_for(named)) is None:
+            return _refusal(KBNotFoundError(f"KB not found: {kb_name}"))
+
         # Scoped lookup: without `kb_name` it walks only readable KBs, so a
         # private entry neither answers nor shadows a readable twin (P-R5),
         # and the entry's links cover readable KBs only (P-R4).
         result = self.svc.get_entry(entry_id, kb_name=kb_name, readable_kbs=readable_kbs)
 
         if not result:
-            return _error(
-                "NOT_FOUND",
-                f"Entry '{entry_id}' not found",
-                suggestion="Use kb_list_entries or kb_search to find entries",
-            )
+            refusal = _refusal(EntryNotFoundError(f"Entry '{entry_id}' not found"))
+            refusal["suggestion"] = "Use kb_list_entries or kb_search to find entries"
+            return refusal
 
         # Chunk first, project second (ADR-0034 rules 1 and 3): `fields` is a
         # token-reduction parameter and must never raise the body bound. #58
@@ -1040,7 +1103,12 @@ class PyriteMCPServer:
             if kb_name is not None and not isinstance(kb_name, str):
                 raise ValidationError(f"kb_name must be a string, not {type(kb_name).__name__}")
             if not named_kb(kb_name):
-                return self.svc.orient_overview(readable_kbs=readable_kbs, detail=detail)
+                return self.svc.orient_overview(
+                    readable_kbs=readable_kbs,
+                    detail=detail,
+                    limit=args.get("limit", 50),
+                    offset=args.get("offset", 0),
+                )
             return self.svc.orient(kb_name, recent_limit=args.get("recent_limit", 5), detail=detail)
         except KBNotFoundError as e:
             # A scoped caller is refused by the dispatcher before this for any
@@ -1384,6 +1452,12 @@ class PyriteMCPServer:
             written = self.svc.update(entry_id, kb_name, updates)
         except ValidationError as e:
             return _refusal(e)
+        except (EntryNotFoundError, KBNotFoundError) as e:
+            # Keep the old handler-level spelling for one release while the
+            # class code becomes the primary contract (ADR-0037).
+            refusal = _refusal(e)
+            refusal["legacy_error_code"] = "UPDATE_FAILED"
+            return refusal
         except PyriteError as e:
             return _error("UPDATE_FAILED", _safe_message(e), retryable=True)
 
@@ -1433,6 +1507,18 @@ class PyriteMCPServer:
         note = args.get("note", "")
         allow_dangling = args.get("allow_dangling", False)
 
+        # The spec is checked here, outside the try below, so VALIDATION_FAILED
+        # is the answer for this refusal only: a ValidationError subclass
+        # raised later inside add_link (storage, frontmatter) keeps the
+        # LINK_FAILED answer it always had (#846, fix round 1). add_link runs
+        # the same check again; it is the rule's home for every other caller.
+        try:
+            target_id, _relation, note = check_link_spec(
+                target_id, relation, note=note, target_kb=target_kb
+            )
+        except ValidationError as e:
+            return _refusal(e)
+
         try:
             result = self.svc.add_link(
                 source_id=source_id,
@@ -1456,8 +1542,18 @@ class PyriteMCPServer:
         return {
             "linked": True,
             "source_id": source_id,
+            # Every echoed field is a string, as tool_schemas.py types the
+            # argument it echoes (fix round 3). `target_id` is the link the
+            # caller asked for, the checked argument -- always text, since
+            # check_link_spec refuses any other type. Not the stored value: on
+            # a replay against a hand file that is whatever YAML made of it
+            # (an int, a bool, a date), which matched the request as text.
+            # `relation` is the one on disk, as `pyrite link` reports it (a
+            # legacy `related` replayed as `related_to`); a match is always
+            # text, and a create stores the checked one. The raw argument
+            # could be null.
             "target_id": target_id,
-            "relation": relation,
+            "relation": result["relation"],
             "resolved": result["resolved"],
             "created": result["created"],
         }
@@ -1625,6 +1721,10 @@ class PyriteMCPServer:
         if not source_kb or not target_kb:
             return _error("MISSING_PARAMETER", "source_kb and target_kb are required")
 
+        include_empty = _boolean_arg(args, "include_empty")
+        if include_empty is None:
+            return _error("INVALID_PARAMETER", "include_empty must be true or false")
+
         svc = self.link_svc
         pairs = svc.batch_suggest(
             source_kb=source_kb,
@@ -1633,6 +1733,7 @@ class PyriteMCPServer:
             mode=args.get("mode", "keyword"),
             exclude_linked=args.get("exclude_linked", True),
             readable_kbs=readable_kbs,
+            include_empty=include_empty,
         )
 
         return {
@@ -1651,6 +1752,10 @@ class PyriteMCPServer:
         if not entry_id or not kb_name:
             return _error("MISSING_PARAMETER", "entry_id and kb_name are required")
 
+        include_empty = _boolean_arg(args, "include_empty")
+        if include_empty is None:
+            return _error("INVALID_PARAMETER", "include_empty must be true or false")
+
         svc = self.link_svc
         candidates = svc.discover_neighbors(
             entry_id=entry_id,
@@ -1660,6 +1765,7 @@ class PyriteMCPServer:
             mode=args.get("mode", "hybrid"),
             exclude_linked=args.get("exclude_linked", True),
             readable_kbs=readable_kbs,
+            include_empty=include_empty,
         )
 
         return {
@@ -1762,6 +1868,7 @@ class PyriteMCPServer:
             "added": results["added"],
             "updated": results["updated"],
             "removed": results["removed"],
+            "skipped": results["skipped"],
         }
 
     def _kb_index_job_status(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1974,6 +2081,18 @@ class PyriteMCPServer:
                 "arguments": [
                     {"name": "entry_a", "description": "First entry ID", "required": True},
                     {"name": "entry_b", "description": "Second entry ID", "required": True},
+                    {
+                        "name": "kb_a",
+                        "description": "KB of the first entry (needed when its id is in "
+                        "more than one KB)",
+                        "required": False,
+                    },
+                    {
+                        "name": "kb_b",
+                        "description": "KB of the second entry (needed when its id is in "
+                        "more than one KB)",
+                        "required": False,
+                    },
                 ],
             },
             "daily_briefing": {
@@ -2032,9 +2151,10 @@ class PyriteMCPServer:
             # logged once, with its traceback (#431); every other refusal
             # (including BrandingInvalidError) is the caller finding out the
             # service said no, not a crash.
-            if isinstance(e, StorageError):
+            logged = isinstance(e, StorageError)
+            if logged:
                 logger.error("Prompt %s failed: %s", name, e, exc_info=e)
-            return _refusal(e)
+            return _refusal(e, already_logged=logged)
 
     def _prompt_research_topic(self, args: dict[str, Any]) -> dict[str, Any]:
         """Generate research prompt for a topic."""
@@ -2112,12 +2232,18 @@ class PyriteMCPServer:
         entry_a_id = args.get("entry_a", "")
         entry_b_id = args.get("entry_b", "")
 
-        # Both lookups span every KB (no kb parameter at all), so each walks
-        # only the readable ones: an entry elsewhere reads as "not found",
-        # exactly as a missing id does, and the embedded links are bounded
-        # the same way.
-        entry_a = self.svc.get_entry(entry_a_id, readable_kbs=readable_kbs)
-        entry_b = self.svc.get_entry(entry_b_id, readable_kbs=readable_kbs)
+        # Without kb_a/kb_b each lookup spans the readable KBs only: an entry
+        # elsewhere reads as "not found", exactly as a missing id does, and
+        # the embedded links are bounded the same way. An id in more than one
+        # readable KB raises AMBIGUOUS (#528), which _get_prompt returns as
+        # the refusal; kb_a/kb_b are how the caller complies (both are in
+        # KB_ARGUMENT_NAMES, so an unreadable one is refused before this).
+        entry_a = self.svc.get_entry(
+            entry_a_id, kb_name=args.get("kb_a"), readable_kbs=readable_kbs
+        )
+        entry_b = self.svc.get_entry(
+            entry_b_id, kb_name=args.get("kb_b"), readable_kbs=readable_kbs
+        )
 
         entry_a_text = (
             json.dumps(entry_a, separators=(",", ":"), default=str)
@@ -2208,7 +2334,14 @@ class PyriteMCPServer:
             {
                 "uriTemplate": f"{URI_SCHEME}entries/{{id}}",
                 "name": "Entry",
-                "description": "Get a specific entry",
+                "description": "Get a specific entry (refused as AMBIGUOUS when the id "
+                "is in more than one KB: use the KB-qualified template)",
+                "mimeType": "application/json",
+            },
+            {
+                "uriTemplate": f"{URI_SCHEME}kbs/{{name}}/entries/{{id}}",
+                "name": "Entry in a KB",
+                "description": "Get a specific entry from a named knowledge base",
                 "mimeType": "application/json",
             },
         ]
@@ -2245,7 +2378,11 @@ class PyriteMCPServer:
             }
 
         # pyrite://kbs/{name}/entries
-        if uri.startswith(f"{URI_SCHEME}kbs/") and uri.endswith("/entries"):
+        if (
+            uri.startswith(f"{URI_SCHEME}kbs/")
+            and uri.endswith("/entries")
+            and "/entries/" not in uri
+        ):
             kb_name = uri[len(f"{URI_SCHEME}kbs/") : -len("/entries")]
             if readable_kbs is not None and kb_name not in readable_kbs:
                 return _kb_not_found(kb_name)
@@ -2260,14 +2397,31 @@ class PyriteMCPServer:
                 ]
             }
 
-        # pyrite://entries/{id}
+        # pyrite://entries/{id} and pyrite://kbs/{name}/entries/{id}
+        entry_id, entry_kb = None, None
         if uri.startswith(f"{URI_SCHEME}entries/"):
             entry_id = uri[len(f"{URI_SCHEME}entries/") :]
-            # The lookup walks the KBs in config order, so it is bounded by the
-            # caller's readable set: an entry in a private KB is a plain miss
-            # (naming the KB would reveal which one holds it) and never hides
-            # a readable entry with the same id; its links are bounded too.
-            entry = self.svc.get_entry(entry_id, readable_kbs=readable_kbs)
+        elif uri.startswith(f"{URI_SCHEME}kbs/") and "/entries/" in uri:
+            entry_kb, _, entry_id = uri[len(f"{URI_SCHEME}kbs/") :].partition("/entries/")
+            # A KB the caller cannot read and a KB that does not exist answer
+            # the same KB_NOT_FOUND (scoped or not), never a plain NOT_FOUND.
+            if (readable_kbs is not None and entry_kb not in readable_kbs) or self.svc.get_kb(
+                entry_kb
+            ) is None:
+                return _kb_not_found(entry_kb)
+        if entry_id is not None:
+            # Without a KB the lookup is bounded by the caller's readable set:
+            # an entry in a private KB is a plain miss (naming the KB would
+            # reveal which one holds it) and never hides or doubles a readable
+            # entry with the same id; its links are bounded too. An id in more
+            # than one readable KB is refused (AMBIGUOUS, #528) in the tool
+            # envelope; the KB-qualified URI is how the caller complies.
+            try:
+                entry = self.svc.get_entry(entry_id, kb_name=entry_kb, readable_kbs=readable_kbs)
+            except PyriteError as e:
+                if isinstance(e, StorageError):
+                    logger.error("Resource %s failed: %s", uri, e, exc_info=e)
+                return _refusal(e)
             if not entry:
                 return _error("NOT_FOUND", f"Entry '{entry_id}' not found")
             return {
@@ -2464,9 +2618,10 @@ class PyriteMCPServer:
             # except a storage fault, which is the server's problem and is
             # logged once, with its traceback (#431). See _refusal for which
             # refusals are retryable.
-            if isinstance(e, StorageError):
+            logged = isinstance(e, StorageError)
+            if logged:
                 logger.error("Tool %s failed: %s", name, e, exc_info=e)
-            return _refusal(e)
+            return _refusal(e, already_logged=logged)
         except Exception as e:
             logger.exception("Tool %s failed with args %s", name, arguments)
             return _error("INTERNAL", str(e), retryable=True)
@@ -2583,7 +2738,7 @@ class PyriteMCPServer:
                 raise ValueError(f"Unknown prompt: {name}")
             result = mcp_server._get_prompt(name, arguments or {}, readable_kbs=_readable_kbs)
             if "error" in result:
-                raise ValueError(result["error"])
+                raise _protocol_refusal(result)
             return GetPromptResult(
                 messages=[
                     PromptMessage(
@@ -2622,7 +2777,7 @@ class PyriteMCPServer:
         async def _read_resource(uri: AnyUrl):
             result = mcp_server._read_resource(str(uri), readable_kbs=_readable_kbs)
             if "error" in result:
-                raise ValueError(result["error"])
+                raise _protocol_refusal(result)
             return [
                 ReadResourceContents(content=c["text"], mime_type=c.get("mimeType"))
                 for c in result["contents"]

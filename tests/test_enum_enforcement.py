@@ -892,7 +892,8 @@ class TestSchemaValidate:
         config, kb = _make_config(tmp_path, kb_yaml(mode))
         _write_org(kb, "acme", **{field: value})
         result = self._run(config, kb)
-        assert "acme.md" in result.output
+        # Rich wraps the path at 80 columns; a longer tmp path (xdist) splits the name.
+        assert "acme.md" in result.output.replace("\n", "")
         assert field in result.output
         if mode:
             assert result.exit_code == 1, result.output

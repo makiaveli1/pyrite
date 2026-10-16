@@ -2120,6 +2120,7 @@
     "body": {
       "backlinks": [],
       "body": "a zebra of no fixed abode",
+      "content_hash": "fe7dc60f356dd2997276b0c2e28444db5334e02d626e49d4f617c57c97f33716",
       "created_at": "<TIMESTAMP>",
       "date": null,
       "entry_type": "note",
@@ -2152,6 +2153,7 @@
     "body": {
       "backlinks": [],
       "body": "a zebra in the open",
+      "content_hash": "75a0ede94d46612f5bd4f9a26fc86dfcf7c40ce08024dae647c9bece56e9e2c1",
       "created_at": "<TIMESTAMP>",
       "date": null,
       "entry_type": "note",
@@ -2601,7 +2603,11 @@
       "name": "no-default-role-kb",
       "path": "<TMPDIR>/no-default-role-kb",
       "path_exists": true,
-      "source": "config"
+      "schema_errors": [],
+      "source": "config",
+      "type_name_drift": [],
+      "type_name_drift_has_more": false,
+      "type_name_drift_total": 0
     },
     "status": 200
   },
@@ -2623,7 +2629,11 @@
       "name": "readable-kb",
       "path": "<TMPDIR>/readable-kb",
       "path_exists": true,
-      "source": "config"
+      "schema_errors": [],
+      "source": "config",
+      "type_name_drift": [],
+      "type_name_drift_has_more": false,
+      "type_name_drift_total": 0
     },
     "status": 200
   },
@@ -2684,6 +2694,8 @@
           "actor_reference": "Event references an actor (resolved from string or wikilink)",
           "advised_by": "Advised by another entity",
           "advises": "Advisory relationship",
+          "amended_by": "An ADR is amended by a later one",
+          "amends": "A later ADR amends an earlier one",
           "answers_question": "Answers a question",
           "asks_question": "Poses a question",
           "authored": "Authorship",
@@ -3033,6 +3045,8 @@
           "actor_reference": "Event references an actor (resolved from string or wikilink)",
           "advised_by": "Advised by another entity",
           "advises": "Advisory relationship",
+          "amended_by": "An ADR is amended by a later one",
+          "amends": "A later ADR amends an earlier one",
           "answers_question": "Answers a question",
           "asks_question": "Poses a question",
           "authored": "Authorship",
@@ -3363,6 +3377,8 @@
         "actor_reference": "Event references an actor (resolved from string or wikilink)",
         "advised_by": "Advised by another entity",
         "advises": "Advisory relationship",
+        "amended_by": "An ADR is amended by a later one",
+        "amends": "A later ADR amends an earlier one",
         "answers_question": "Answers a question",
         "asks_question": "Poses a question",
         "authored": "Authorship",
@@ -3689,6 +3705,8 @@
         "actor_reference": "Event references an actor (resolved from string or wikilink)",
         "advised_by": "Advised by another entity",
         "advises": "Advisory relationship",
+        "amended_by": "An ADR is amended by a later one",
+        "amends": "A later ADR amends an earlier one",
         "answers_question": "Answers a question",
         "asks_question": "Poses a question",
         "authored": "Authorship",
@@ -4513,6 +4531,12 @@
   "GET /api/search | global_user | no-default-role-kb": {
     "body": {
       "count": "<ENUMERATION_CONTENT>",
+      "keyword_match": "all_terms",
+      "legs_run": [
+        "keyword"
+      ],
+      "match": "strong",
+      "match_basis": "keyword: every term matched",
       "query": "zebra",
       "results": [
         {
@@ -4535,6 +4559,12 @@
   "GET /api/search | global_user | readable-kb": {
     "body": {
       "count": "<ENUMERATION_CONTENT>",
+      "keyword_match": "all_terms",
+      "legs_run": [
+        "keyword"
+      ],
+      "match": "strong",
+      "match_basis": "keyword: every term matched",
       "query": "zebra",
       "results": [
         {

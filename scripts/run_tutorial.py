@@ -38,8 +38,11 @@ What this deliberately does:
   `<!-- runner: expect-ids ID [KB:ID ...] -->`  after a ```bash block: the
       block's JSON output must list every one of these entries. A search that
       "returns something" passes on the wrong entries; this names the right ones.
-  `<!-- runner: expect-exit N -->`  before a ```bash block: the block must
-      exit N (not 0). For the commands a tutorial shows being refused.
+  `<!-- runner: expect-exit N [N ...] -->`  before a ```bash block: the block must
+      exit one of N (the default is 0). For the commands a tutorial shows being
+      refused, and, with two codes, for a command whose result the machine
+      decides: `pyrite index embed` exits 0 with the model cached and 1 without
+      it.
   `<!-- runner: expect-text WORD -->`  after a ```bash block: WORD appears in
       its output (stdout or stderr). Repeat the line for more words.
   `<!-- runner: seed FIXTURE_DIR TARGET_DIR -->`  stands in for a step only a
@@ -112,10 +115,33 @@ class TutorialError(Exception):
 #: Where the stub `claude` records its calls, relative to the temp HOME.
 CLAUDE_CALLS = ".tutorial-claude-calls.jsonl"
 
+#: Records each call, and does what `claude mcp add|remove -s user` does to
+#: the temp HOME's `.claude.json`: `pyrite mcp-setup` reads that file back
+#: and reports `created` only when the entry is in it (#690).
 STUB_CLAUDE = """#!{python}
 import json, os, sys
-with open(os.path.join(os.environ["HOME"], "{log}"), "a") as log:
-    log.write(json.dumps(sys.argv[1:]) + "\\n")
+home, args = os.environ["HOME"], sys.argv[1:]
+with open(os.path.join(home, "{log}"), "a") as log:
+    log.write(json.dumps(args) + "\\n")
+if args[:2] in (["mcp", "add"], ["mcp", "remove"]):
+    path = os.path.join(home, ".claude.json")
+    data = {{}}
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    servers = data.setdefault("mcpServers", {{}})
+    cut = args.index("--") if "--" in args else len(args)
+    opts = args[2:cut]
+    names = [
+        a for i, a in enumerate(opts)
+        if not a.startswith("-") and not (i and opts[i - 1].startswith("-"))
+    ]
+    if args[1] == "remove":
+        servers.pop(names[0], None)
+    elif names and args[cut + 1:]:
+        servers[names[0]] = dict(type="stdio", command=args[cut + 1], args=args[cut + 2:], env={{}})
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 """
 
 
@@ -415,6 +441,10 @@ def main(argv: list[str]) -> int:
 
     home = Path(tempfile.mkdtemp(prefix="pyrite-tutorial-home-"))
     env = dict(os.environ)
+    # Claude Code's file is $CLAUDE_CONFIG_DIR/.claude.json when that is set.
+    # Unset, so mcp-setup and the stub `claude` both use the temp HOME's and
+    # the caller's own file is neither read nor written.
+    env.pop("CLAUDE_CONFIG_DIR", None)
     env.update(
         {
             "HOME": str(home),
@@ -433,7 +463,8 @@ def main(argv: list[str]) -> int:
     # `pyrite mcp-setup` registers the server with the MCP clients it finds and
     # exits 1 when it finds none (#582), and a CI runner has none. A stub
     # `claude` stands in for Claude Code, first on PATH so a caller's real one
-    # is never called; it records each call, and check_claude_calls reads back
+    # is never called; it records each call and writes the temp HOME's
+    # .claude.json as Claude Code would, and check_claude_calls reads back
     # what the doc asked it to add.
     stub_bin = home / ".tutorial-bin"
     stub_bin.mkdir()
@@ -456,7 +487,7 @@ def main(argv: list[str]) -> int:
     health_kb = "my-research"
     last: tuple[str, str] | None = None  # (block, stdout) of the block that ran last
     last_output = ""  # stdout + stderr of that block
-    exit_wanted = 0  # set by `expect-exit` for the next block
+    exit_wanted: tuple[int, ...] = (0,)  # set by `expect-exit` for the next block
     try:
         for number, (kind, text) in enumerate(items, start=1):
             if kind == "directive":
@@ -466,8 +497,12 @@ def main(argv: list[str]) -> int:
                         raise TutorialError(f"`{text}` follows no command that ran")
                     print(f"  [{number}] expect-ids {' '.join(words[1:])}")
                     assert_expected_ids(last[0], last[1], words[1:])
-                elif words[:1] == ["expect-exit"] and len(words) == 2 and words[1].isdigit():
-                    exit_wanted = int(words[1])
+                elif (
+                    words[:1] == ["expect-exit"]
+                    and len(words) > 1
+                    and all(w.isdigit() for w in words[1:])
+                ):
+                    exit_wanted = tuple(int(w) for w in words[1:])
                 elif words[:1] == ["expect-text"] and len(words) > 1:
                     if last is None:
                         raise TutorialError(f"`{text}` follows no command that ran")
@@ -499,13 +534,13 @@ def main(argv: list[str]) -> int:
             print(f"  [{number}] {first}")
             assert_no_and_lists(block)
             proc = run_block(block, cwd, env)
-            if proc.returncode != exit_wanted:
+            if proc.returncode not in exit_wanted:
                 raise TutorialError(
                     f"block {number} of {doc.name} exited {proc.returncode}, "
-                    f"the document says {exit_wanted}:\n"
+                    f"the document says {' or '.join(map(str, exit_wanted))}:\n"
                     f"{block}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
                 )
-            exit_wanted = 0
+            exit_wanted = (0,)
             if proc.returncode == 0:
                 assert_search_returned_results(block, proc.stdout, proc.stderr)
             last = (block, proc.stdout)

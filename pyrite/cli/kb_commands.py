@@ -177,7 +177,10 @@ def kb_discover(
     search_path: Path | None = typer.Argument(None, help="Path to search for KBs"),
     add: bool = typer.Option(False, "--add", "-a", help="Add discovered KBs to registry"),
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """Auto-discover knowledge bases by finding kb.yaml files."""
@@ -190,20 +193,41 @@ def kb_discover(
         console.print("[yellow]No KB configurations found.[/yellow]")
         return
 
-    formatted = _format_output(
-        {
-            "discovered": [
-                {
-                    "name": kb.name,
-                    "type": kb.kb_type,
-                    "path": str(kb.path),
-                    "already_registered": config.get_kb(kb.name) is not None,
-                }
-                for kb in discovered
-            ]
-        },
-        output_format,
-    )
+    # Snapshot discovery before registration so output keeps its original status.
+    data = {
+        "discovered": [
+            {
+                "name": kb.name,
+                "type": kb.kb_type,
+                "path": str(kb.path),
+                "already_registered": config.get_kb(kb.name) is not None,
+            }
+            for kb in discovered
+        ]
+    }
+
+    added = 0
+    if add:
+        from ..exceptions import KBAlreadyExistsError
+
+        with cli_registry_context() as (_, _, _, registry):
+            for kb in discovered:
+                if not config.get_kb(kb.name):
+                    try:
+                        registry.add_kb(
+                            name=kb.name,
+                            path=str(kb.path),
+                            kb_type=kb.kb_type,
+                            description=kb.description,
+                        )
+                        added += 1
+                    except KBAlreadyExistsError:
+                        pass  # Already registered, including duplicate discovered names.
+                    except (PyriteError, ValueError) as exc:
+                        _kb_error(exc, output_format)
+
+    # The requested write must finish before any presentation branch can return.
+    formatted = _format_output(data, output_format)
     if formatted is not None:
         typer.echo(formatted)
         return
@@ -224,30 +248,18 @@ def kb_discover(
 
     console.print(table)
 
-    if add:
-        with cli_registry_context() as (_, _, _, registry):
-            added = 0
-            for kb in discovered:
-                if not config.get_kb(kb.name):
-                    try:
-                        registry.add_kb(
-                            name=kb.name,
-                            path=str(kb.path),
-                            kb_type=kb.kb_type,
-                            description=kb.description,
-                        )
-                        added += 1
-                    except (PyriteError, ValueError):
-                        pass  # Already exists in DB
-            if added:
-                console.print(f"[green]Added {added} KB(s) to registry.[/green]")
+    if added:
+        console.print(f"[green]Added {added} KB(s) to registry.[/green]")
 
 
 @kb_app.command("validate")
 def kb_validate(
     name: str | None = typer.Argument(None, help="Name of KB to validate (all if omitted)"),
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """Validate knowledge base configuration and contents.
@@ -449,7 +461,10 @@ def kb_create(
 def kb_reindex(
     kb_name: str = typer.Option(..., "--kb", "-k", help="Knowledge base name"),
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """Reindex a specific knowledge base."""
@@ -471,6 +486,17 @@ def kb_reindex(
         console.print(
             f"  Added: {result['added']}, Updated: {result['updated']}, Removed: {result['removed']}"
         )
+        skipped = result.get("skipped", [])
+        if skipped:
+            console.print(f"  [yellow]Non-regular: {len(skipped)} file(s) skipped[/yellow]")
+            for entry in skipped[:5]:
+                console.print(
+                    f"    {entry['path']}: {entry['reason']}",
+                    markup=False,
+                    highlight=False,
+                )
+            if len(skipped) > 5:
+                console.print(f"    [dim]... and {len(skipped) - 5} more[/dim]")
         duplicates = result.get("duplicates", [])
         if duplicates:
             from .index_commands import _duplicate_lines
@@ -484,7 +510,10 @@ def kb_reindex(
 def kb_health(
     kb_name: str = typer.Option(..., "--kb", "-k", help="Knowledge base name"),
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """Check health of a knowledge base."""
@@ -509,6 +538,14 @@ def kb_health(
         console.print(f"  Files: {result['file_count']}, Indexed entries: {result['entry_count']}")
         console.print(f"  Last indexed: {result['last_indexed'] or 'never'}")
         console.print(f"  Source: {result['source']}")
+        for err in result.get("schema_errors", []):
+            console.print(
+                f"  kb.yaml failed to load: {err['error']}", markup=False, highlight=False
+            )
+        if result.get("type_name_drift_total"):
+            console.print(
+                f"  [yellow]Type name drift: {result['type_name_drift_total']} group(s); use --format json for spellings[/yellow]"
+            )
 
 
 @kb_app.command("commit")
@@ -521,6 +558,8 @@ def kb_commit(
     sign_off: bool = typer.Option(False, "--signoff", "-s", help="Add Signed-off-by line"),
 ):
     """Commit changes in a KB's git repository."""
+    from ..utils.errors import cli_error
+
     with cli_context() as (config, db, svc):
         from ..services.export_service import ExportService
 
@@ -533,8 +572,18 @@ def kb_commit(
                 if result.get("files"):
                     for f in result["files"]:
                         console.print(f"  [dim]{f}[/dim]")
+            elif result.get("error") == "No changes to commit":
+                # Nothing to do is the asked-for end state, not a failure.
+                console.print("[yellow]No commit:[/yellow] No changes to commit")
             else:
-                console.print(f"[yellow]No commit:[/yellow] {result.get('error', 'Unknown error')}")
+                # A hook rejected it, staging failed, ...: the commit was asked for
+                # and did not happen (#526).
+                cli_error(
+                    result.get("error", "Unknown error"),
+                    error_code="COMMIT_FAILED",
+                )
+        except typer.Exit:
+            raise
         except Exception as e:
             _kb_error(e)
 
@@ -591,7 +640,13 @@ kb_app.add_typer(schema_app, name="schema")
 @schema_app.command("show")
 def schema_show(
     kb_name: str = typer.Argument(..., help="Knowledge base name"),
-    output_format: str = typer.Option("json", "--format", "-f", help="Output format: json, rich"),
+    output_format: str = typer.Option(
+        "json",
+        "--format",
+        "-f",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
+    ),
 ):
     """Show the current schema for a KB."""
     from ..services.schema_service import SchemaService
@@ -645,7 +700,13 @@ def schema_add_type(
     required: str = typer.Option("", "--required", "-r", help="Comma-separated required fields"),
     optional: str = typer.Option("", "--optional", "-o", help="Comma-separated optional fields"),
     subdirectory: str = typer.Option("", "--subdirectory", "-s", help="Subdirectory for files"),
-    output_format: str = typer.Option("json", "--format", "-f", help="Output format: json, rich"),
+    output_format: str = typer.Option(
+        "json",
+        "--format",
+        "-f",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
+    ),
 ):
     """Add a type definition to a KB's schema."""
     from ..services.schema_service import SchemaService
@@ -684,7 +745,13 @@ def schema_add_type(
 def schema_remove_type(
     kb_name: str = typer.Argument(..., help="Knowledge base name"),
     type_name: str = typer.Option(..., "--type", "-t", help="Type name to remove"),
-    output_format: str = typer.Option("json", "--format", "-f", help="Output format: json, rich"),
+    output_format: str = typer.Option(
+        "json",
+        "--format",
+        "-f",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
+    ),
 ):
     """Remove a type definition from a KB's schema."""
     from ..services.schema_service import SchemaService
@@ -713,23 +780,23 @@ def schema_remove_type(
 def schema_set(
     kb_name: str = typer.Argument(..., help="Knowledge base name"),
     schema_file: Path = typer.Option(..., "--schema-file", "-s", help="YAML file with schema"),
-    output_format: str = typer.Option("json", "--format", "-f", help="Output format: json, rich"),
+    output_format: str = typer.Option(
+        "json",
+        "--format",
+        "-f",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
+    ),
 ):
     """Replace schema from a YAML file."""
     from ..services.schema_service import SchemaService
     from ..utils.yaml import load_yaml_file as load_yaml
+    from .context import input_file_or_exit
+
+    # Before the KB lookup: that opens (and may create) the index DB.
+    input_file_or_exit(schema_file, "Schema file", output_format)
 
     config = get_config_with_registered_kbs(load_config(), name=kb_name)
-
-    if not schema_file.exists():
-        from ..utils.errors import cli_error
-
-        cli_error(
-            f"File not found: {schema_file}",
-            output_format,
-            error_code="NOT_FOUND",
-            suggestion="Pass an existing YAML file with --schema-file.",
-        )
 
     schema = load_yaml(schema_file)
 

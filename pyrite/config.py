@@ -21,7 +21,12 @@ from typing import Any, Literal
 
 from dotenv import load_dotenv
 
-from pyrite.exceptions import ConfigError, ConfigFileUnreadableError, ConfigSaveRefusedError
+from pyrite.exceptions import (
+    ConfigError,
+    ConfigFileUnreadableError,
+    ConfigSaveRefusedError,
+    KBNotFoundError,
+)
 from pyrite.utils.yaml import dump_yaml_file, load_yaml_file
 
 logger = logging.getLogger(__name__)
@@ -477,6 +482,25 @@ class PyriteConfig:
         """Rebuild the lookup indexes."""
         self._kb_by_name = {kb.name: kb for kb in self.knowledge_bases}
         self._repo_by_name = {repo.name: repo for repo in self.repositories}
+        for message in self._shortname_collisions():
+            logger.warning("%s; the full name wins", message)
+
+    def _shortname_collisions(self) -> list[str]:
+        """Shortnames that equal another KB's full name, or each other (#912)."""
+        found: list[str] = []
+        seen: dict[str, str] = {}
+        for kb in self.knowledge_bases:
+            short = kb.shortname
+            if not short:
+                continue
+            if short in self._kb_by_name and short != kb.name:
+                found.append(
+                    f"KB '{kb.name}' has shortname '{short}', which is KB '{short}'s full name"
+                )
+            if short in seen and seen[short] != kb.name:
+                found.append(f"KBs '{seen[short]}' and '{kb.name}' share shortname '{short}'")
+            seen.setdefault(short, kb.name)
+        return found
 
     # Fallback lookup for DB-registered KBs not in config.yaml
     _db_kb_cache: dict[str, KBConfig] = field(default_factory=dict, repr=False)
@@ -496,6 +520,19 @@ class PyriteConfig:
         if kb:
             return kb
         return self._db_kb_cache.get(name)
+
+    def require_kb(self, name: str) -> KBConfig:
+        """The KB a request names, or ``KBNotFoundError`` (``KB_NOT_FOUND``).
+
+        For a service read that would otherwise answer an empty result for a
+        name that matches no KB, so the caller is told the KB does not exist
+        instead of that it holds nothing (#846). Same lookup as
+        :meth:`get_kb`: config.yaml first, then DB-registered KBs.
+        """
+        kb = self.get_kb(name)
+        if kb is None:
+            raise KBNotFoundError(f"KB not found: {name}")
+        return kb
 
     def confined_default_role(self, value: str | None) -> str | None:
         """A default_role as this config may honour it. Under an untrusted
@@ -614,6 +651,16 @@ class PyriteConfig:
                 return kb
         return None
 
+    def kb_name_for(self, name: str) -> str:
+        """The KB a name given as ``kb`` means: a KB's full name is itself; a
+        shortname maps to its KB's full name; anything else is returned
+        unchanged (an unknown name the caller's lookup will miss). The one mapping every
+        ``kb`` parameter and ``kb:`` wikilink prefix shares (#912)."""
+        if self.get_kb(name):
+            return name  # a full name wins over another KB's shortname
+        kb = self.get_kb_by_shortname(name)
+        return kb.name if kb else name
+
     def list_kbs(self, kb_type: str | None = None) -> list[KBConfig]:
         """List all KBs, optionally filtered by type."""
         if kb_type is None:
@@ -678,6 +725,9 @@ class PyriteConfig:
     def validate(self) -> dict[str, list[str]]:
         """Validate all KBs and repos. Returns dict of name -> errors."""
         results = {}
+        collisions = self._shortname_collisions()
+        if collisions:
+            results["shortnames"] = collisions
         for kb in self.knowledge_bases:
             errors = kb.validate()
             if errors:

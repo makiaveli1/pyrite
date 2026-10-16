@@ -82,7 +82,7 @@ def sync_index(
         # embed`, because there is nobody left to wait for it.
         from ..api import _drain_embed_queue
 
-        _drain_embed_queue(index_mgr.db)
+        _drain_embed_queue(index_mgr.db, model_name=index_mgr.config.settings.embedding_model)
 
         # Broadcast WebSocket event
         from ..websocket import broadcast_event
@@ -136,6 +136,7 @@ def sync_index(
             added=result.get("added", 0),
             updated=result.get("updated", 0),
             removed=result.get("removed", 0),
+            skipped=result.get("skipped", []),
             site_cache=site_cache_status,
         )
 
@@ -221,7 +222,7 @@ async def render_site_cache(
     """
     import asyncio
 
-    from ...exceptions import BrandingInvalidError
+    from ...exceptions import BrandingInvalidError, public_text
 
     try:
         svc = await asyncio.to_thread(build_site_cache)
@@ -231,7 +232,11 @@ async def render_site_cache(
         # str(e) here previously leaked the branding.yaml path over HTTP).
         logger.warning("Site cache render refused: invalid branding.yaml: %s", e)
         raise HTTPException(
-            status_code=409, detail={"code": "BRANDING_INVALID", "message": e.public_message}
+            status_code=409,
+            detail={
+                "code": "BRANDING_INVALID",
+                "message": public_text(e, already_logged=True, log=logger),
+            },
         ) from None
     stats = await asyncio.to_thread(svc.render_all)
     return {"rendered": True, **stats}

@@ -204,3 +204,248 @@ class TestExclusiveSaveFallsBackWithoutHardLinks:
 
         assert path.exists()
         assert "b" in path.read_text()
+
+
+class TestExclusiveSaveFailurePaths:
+    """#477: every fallback failure must preserve exclusive-publish semantics."""
+
+    def _make_link_raise(self, monkeypatch, err):
+        def fail_link(src, dst):
+            raise OSError(err, "simulated: hard links not supported")
+
+        monkeypatch.setattr(os, "link", fail_link)
+
+    def test_failed_replace_removes_the_placeholder_claim(self, tmp_path, monkeypatch):
+        import errno
+
+        self._make_link_raise(monkeypatch, errno.EPERM)
+        path = tmp_path / "note.md"
+        real_replace = os.replace
+
+        def fail_publish(src, dst):
+            if os.fspath(dst) == os.fspath(path):
+                raise OSError(errno.ENOSPC, "simulated full filesystem")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", fail_publish)
+        with pytest.raises(OSError) as exc:
+            NoteEntry(id="note", title="t", body="payload").save(path, exclusive=True)
+
+        assert exc.value.errno == errno.ENOSPC
+        assert not path.exists(), "a failed publish must not leave an empty claimed path"
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.control(
+        reason="dev never claimed a placeholder, so it never removed one; guards the "
+        "samestat check on #643's cleanup path"
+    )
+    def test_failed_replace_preserves_a_concurrent_replacement(self, tmp_path, monkeypatch):
+        import errno
+
+        self._make_link_raise(monkeypatch, errno.EPERM)
+        path = tmp_path / "note.md"
+        winner = tmp_path / "winner.tmp"
+        real_replace = os.replace
+
+        def publish_winner_then_fail(src, dst):
+            winner.write_text("concurrent winner", encoding="utf-8")
+            real_replace(winner, dst)
+            raise OSError(errno.ENOSPC, "simulated publish failure after replacement")
+
+        monkeypatch.setattr(os, "replace", publish_winner_then_fail)
+        with pytest.raises(OSError) as exc:
+            NoteEntry(id="note", title="t", body="candidate").save(path, exclusive=True)
+
+        assert exc.value.errno == errno.ENOSPC
+        assert path.read_text(encoding="utf-8") == "concurrent winner"
+        assert [p.name for p in tmp_path.iterdir()] == ["note.md"]
+
+    def test_transient_unlink_error_after_successful_link_still_succeeds(
+        self, tmp_path, monkeypatch
+    ):
+        import errno
+        from pathlib import Path
+
+        path = tmp_path / "note.md"
+        real_unlink = os.unlink
+        state = {"attempts": 0}
+
+        def fail_temp_unlink_once(path_arg, *args, **kwargs):
+            candidate = Path(path_arg)
+            if candidate.parent == tmp_path and candidate.suffix == ".tmp":
+                state["attempts"] += 1
+                if state["attempts"] == 1:
+                    raise OSError(errno.EIO, "simulated transient temp unlink failure")
+            return real_unlink(path_arg, *args, **kwargs)
+
+        monkeypatch.setattr(os, "unlink", fail_temp_unlink_once)
+        result = NoteEntry(id="note", title="t", body="published").save(path, exclusive=True)
+
+        assert result == path
+        assert state["attempts"] == 2
+        assert "published" in path.read_text(encoding="utf-8")
+        assert [p.name for p in tmp_path.iterdir()] == ["note.md"]
+
+    def test_enospc_on_exclusive_claim_propagates_and_preserves_winner(self, tmp_path, monkeypatch):
+        import errno
+
+        self._make_link_raise(monkeypatch, errno.EPERM)
+        path = tmp_path / "note.md"
+        real_open = os.open
+
+        def fail_claim_after_racer(path_arg, flags, *args, **kwargs):
+            if os.fspath(path_arg) == os.fspath(path) and flags & os.O_EXCL:
+                path.write_text("concurrent winner", encoding="utf-8")
+                raise OSError(errno.ENOSPC, "simulated full filesystem")
+            return real_open(path_arg, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", fail_claim_after_racer)
+        with pytest.raises(OSError) as exc:
+            NoteEntry(id="note", title="t", body="candidate").save(path, exclusive=True)
+
+        assert exc.value.errno == errno.ENOSPC
+        assert path.read_text(encoding="utf-8") == "concurrent winner"
+
+    def test_edquot_on_exclusive_claim_propagates_and_preserves_winner(self, tmp_path, monkeypatch):
+        import errno
+
+        error_number = getattr(errno, "EDQUOT", None)
+        if error_number is None:
+            pytest.skip("EDQUOT is not available on this platform")
+
+        self._make_link_raise(monkeypatch, errno.EPERM)
+        path = tmp_path / "note.md"
+        real_open = os.open
+
+        def fail_claim_after_racer(path_arg, flags, *args, **kwargs):
+            if os.fspath(path_arg) == os.fspath(path) and flags & os.O_EXCL:
+                path.write_text("concurrent winner", encoding="utf-8")
+                raise OSError(error_number, "simulated quota exceeded")
+            return real_open(path_arg, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", fail_claim_after_racer)
+        with pytest.raises(OSError) as exc:
+            NoteEntry(id="note", title="t", body="candidate").save(path, exclusive=True)
+
+        assert exc.value.errno == error_number
+        assert path.read_text(encoding="utf-8") == "concurrent winner"
+
+    @pytest.mark.control(
+        reason="dev already let every link error fall through; guards #643 review item 2 "
+        "(a link errno allow-list failed every create on e.g. EACCES network shares)"
+    )
+    @pytest.mark.parametrize("err", ["EINVAL", "EIO", "EACCES", "EPERM", "EXDEV"])
+    def test_any_link_error_but_eexist_falls_through_to_the_exclusive_claim(
+        self, tmp_path, monkeypatch, err
+    ):
+        import errno
+
+        self._make_link_raise(monkeypatch, getattr(errno, err))
+        path = tmp_path / "note.md"
+        real_open = os.open
+        claims = []
+
+        def observe_open(path_arg, flags, *args, **kwargs):
+            if os.fspath(path_arg) == os.fspath(path) and flags & os.O_EXCL:
+                claims.append(path_arg)
+            return real_open(path_arg, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "open", observe_open)
+        NoteEntry(id="note", title="t", body="payload").save(path, exclusive=True)
+
+        assert claims, "the O_EXCL claim is still exclusive; a link error must reach it"
+        assert "payload" in path.read_text(encoding="utf-8")
+        assert [p.name for p in tmp_path.iterdir()] == ["note.md"]
+
+    def test_io_error_on_both_link_and_claim_raises_without_a_plain_replace(
+        self, tmp_path, monkeypatch
+    ):
+        import errno
+
+        self._make_link_raise(monkeypatch, errno.EIO)
+        path = tmp_path / "note.md"
+        real_open = os.open
+        replaces = []
+        real_replace = os.replace
+
+        def fail_claim(path_arg, flags, *args, **kwargs):
+            if os.fspath(path_arg) == os.fspath(path) and flags & os.O_EXCL:
+                raise OSError(errno.EIO, "simulated I/O failure")
+            return real_open(path_arg, flags, *args, **kwargs)
+
+        def spy_replace(src, dst):
+            replaces.append(dst)
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(os, "open", fail_claim)
+        monkeypatch.setattr(os, "replace", spy_replace)
+        with pytest.raises(OSError) as exc:
+            NoteEntry(id="note", title="t", body="candidate").save(path, exclusive=True)
+
+        assert exc.value.errno == errno.EIO
+        assert replaces == [], "an I/O error is not 'unsupported': no non-exclusive replace"
+        assert list(tmp_path.iterdir()) == []
+
+    def test_temp_name_left_after_a_successful_link_is_reported(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """#643 review item 1: a stray second hard link is not harmless (#752).
+
+        It blocks ``ids pin`` (nlink > 1) and keeps the old content after the
+        next update gives the entry a new inode. The save still succeeded, so
+        it returns; but the leftover is logged by name for someone to remove.
+        """
+        import errno
+        import logging
+
+        path = tmp_path / "note.md"
+        real_unlink = os.unlink
+        refused = []
+
+        def refuse_temp_unlink(path_arg, *args, **kwargs):
+            if os.fspath(path_arg).endswith(".tmp"):
+                refused.append(os.fspath(path_arg))
+                raise OSError(errno.EBUSY, "simulated: held open by a scanner")
+            return real_unlink(path_arg, *args, **kwargs)
+
+        monkeypatch.setattr(os, "unlink", refuse_temp_unlink)
+        with caplog.at_level(logging.WARNING, logger="pyrite.models.base"):
+            result = NoteEntry(id="note", title="t", body="published").save(path, exclusive=True)
+
+        assert result == path
+        assert "published" in path.read_text(encoding="utf-8")
+        assert refused, "the temp name was never unlinked"
+        leftover = refused[-1]
+        assert os.path.exists(leftover)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any(leftover in r.getMessage() for r in warnings), (
+            "the leftover second link must be named in a warning"
+        )
+
+    @pytest.mark.control(
+        reason="dev has no post-claim fstat; this fails at #643's 114af3a6, where a "
+        "failed fstat left the 0-byte placeholder at the target"
+    )
+    def test_failed_fstat_on_the_claim_leaves_no_placeholder(self, tmp_path, monkeypatch):
+        """#643 review item 3: the claim's 0-byte placeholder is cleaned up
+        whatever fails after O_EXCL succeeds, not only ``os.replace``.
+
+        The invariant: publish exactly the new file, or raise and leave the
+        target as it was (absent here) with nothing else behind.
+        """
+        import errno
+
+        self._make_link_raise(monkeypatch, errno.EPERM)
+        path = tmp_path / "note.md"
+
+        def fail_fstat(fd):
+            raise OSError(errno.EIO, "simulated fstat failure")
+
+        monkeypatch.setattr(os, "fstat", fail_fstat)
+        try:
+            NoteEntry(id="note", title="t", body="payload").save(path, exclusive=True)
+        except OSError:
+            assert list(tmp_path.iterdir()) == [], "a failed save left a placeholder behind"
+        else:
+            assert "payload" in path.read_text(encoding="utf-8")
+            assert [p.name for p in tmp_path.iterdir()] == ["note.md"]

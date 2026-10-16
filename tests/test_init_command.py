@@ -11,6 +11,8 @@ from typer.testing import CliRunner
 
 from pyrite.cli.init_command import init_kb
 from pyrite.config import PyriteConfig, Settings
+from pyrite.models.core_types import NoteEntry
+from pyrite.utils.errors import PARTIAL_EXIT
 
 runner = CliRunner()
 
@@ -135,6 +137,51 @@ class TestInitCommand:
         assert data["status"] == "created"
         assert data["template"] == "software"
         assert "types" in data
+
+    def test_init_reports_entries_indexed_for_seeded_entries(self, init_env):
+        """Init on a directory pre-seeded with entries reports entries_indexed matching the count (#909)."""
+        kb_path = init_env["tmpdir"] / "seeded-kb"
+        notes_dir = kb_path / "notes"
+        notes_dir.mkdir(parents=True)
+        NoteEntry(id="n1", title="Note 1", body="body 1").save(notes_dir / "n1.md")
+        NoteEntry(id="n2", title="Note 2", body="body 2").save(notes_dir / "n2.md")
+        NoteEntry(id="n3", title="Note 3", body="body 3").save(notes_dir / "n3.md")
+        config = init_env["config"]
+
+        with (
+            patch("pyrite.config.load_config", return_value=config),
+            patch("pyrite.config.save_config"),
+        ):
+            result = runner.invoke(
+                test_app, ["--template", "software", "--path", str(kb_path), "--format", "json"]
+            )
+
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["status"] == "created"
+        assert data["entries_indexed"] == 3
+
+    def test_init_reports_indexing_error_and_exits_partial_when_indexing_fails(self, init_env):
+        """When initial indexing fails without mocking, init reports indexing_error and exits PARTIAL_EXIT (#909)."""
+        kb_path = init_env["tmpdir"] / "fail-index-kb"
+        # Seed an unopenable/corrupt database file so indexing fails at the storage level without mocking
+        init_env["db_path"].write_bytes(b"not a valid sqlite database")
+        config = init_env["config"]
+
+        with (
+            patch("pyrite.config.load_config", return_value=config),
+            patch("pyrite.config.save_config"),
+        ):
+            result = runner.invoke(
+                test_app, ["--template", "empty", "--path", str(kb_path), "--format", "json"]
+            )
+
+        assert result.exit_code == PARTIAL_EXIT, result.output
+        data = json.JSONDecoder().raw_decode(result.output[result.output.index("{") :])[0]
+        assert data["status"] == "created"
+        assert data["entries_indexed"] == 0
+        assert "indexing_error" in data
+        assert data["indexing_error"]
 
     def test_init_intellectual_biography_template(self, init_env):
         """Init with intellectual-biography template creates expected directories and types."""

@@ -22,7 +22,7 @@ from .config import (
     save_config,
 )
 from .logging import configure_entry_point_logging, logging_epilog
-from .utils.errors import PyriteCLIGroup, cli_error
+from .utils.errors import PyriteCLIGroup, cli_error, exit_unless_whole
 
 app = typer.Typer(
     cls=PyriteCLIGroup,
@@ -179,17 +179,17 @@ def index_build(
 ):
     """Build or rebuild the search index."""
     from .cli.context import index_db_context
-    from .storage import IndexManager
+    from .services.kb_service import KBService
 
     config = load_config()
     with index_db_context(config) as db:
-        index_mgr = IndexManager(db, config)
+        kb_svc = KBService(config, db)
 
         if kb_name:
-            count = index_mgr.index_kb(kb_name)
+            count = kb_svc.index_kb(kb_name)
             console.print(f"[green]Indexed {count} entries from {kb_name}[/green]")
         else:
-            results = index_mgr.index_all()
+            results = kb_svc.build_index()
             total = sum(results.values())
             console.print(f"[green]Indexed {total} entries across {len(results)} KBs[/green]")
 
@@ -200,29 +200,40 @@ def index_sync(
 ):
     """Incremental index sync with file changes."""
     from .cli.context import index_db_context
-    from .storage import IndexManager
+    from .services.kb_service import KBService
 
     config = load_config()
     with index_db_context(config) as db:
-        index_mgr = IndexManager(db, config)
+        kb_svc = KBService(config, db)
 
-        results = index_mgr.sync_incremental(kb_name)
+        results = kb_svc.sync_index(kb_name)
         console.print(
             f"[green]Synced:[/green] +{results['added']} -{results['removed']} ~{results['updated']}"
         )
+        skipped = results.get("skipped", [])
+        if skipped:
+            console.print(f"[yellow]Non-regular: {len(skipped)} file(s) skipped[/yellow]")
+            for entry in skipped[:5]:
+                console.print(
+                    f"  {entry['path']}: {entry['reason']}",
+                    markup=False,
+                    highlight=False,
+                )
+            if len(skipped) > 5:
+                console.print(f"  ... and {len(skipped) - 5} more")
 
 
 @index_app.command("stats")
 def index_stats(kb_name: str | None = typer.Argument(None, help="KB name")):
     """Show index statistics."""
     from .cli.context import index_db_context
-    from .storage import IndexManager
+    from .services.kb_service import KBService
 
     config = load_config()
     with index_db_context(config) as db:
-        index_mgr = IndexManager(db, config)
+        kb_svc = KBService(config, db)
 
-        stats = index_mgr.get_index_stats()
+        stats = kb_svc.get_index_stats()
         console.print(f"[bold]Total entries:[/bold] {stats.get('total_entries', 0)}")
         console.print(f"[bold]Total tags:[/bold] {stats.get('total_tags', 0)}")
         console.print(f"[bold]Total links:[/bold] {stats.get('total_links', 0)}")
@@ -232,31 +243,66 @@ def index_stats(kb_name: str | None = typer.Argument(None, help="KB name")):
 def index_embed(kb_name: str = typer.Argument(..., help="KB to generate embeddings for")):
     """Generate vector embeddings for semantic search."""
 
-    from .cli.context import index_db_context
+    from .cli.context import get_config_and_db
+    from .services.embedding_service import (
+        EmbeddingService,
+        is_available,
+        semantic_unavailable_for,
+    )
+    from .utils.install_hints import extra_install_command
 
-    config = load_config()
-    with index_db_context(config) as db:
-        try:
-            from .services.embedding_service import EmbeddingService
+    if not is_available():
+        # Nothing was embedded: refused, exit 1 (#526). `cli_error` keeps the
+        # brackets of `pyrite[semantic]` literal; a markup string would not.
+        cli_error(
+            "sentence-transformers is not installed.",
+            error_code="DEPENDENCY_MISSING",
+            suggestion=f"Install semantic extras: {extra_install_command('semantic')}",
+        )
 
-            embed_svc = EmbeddingService(db)
-            count = embed_svc.embed_kb(kb_name)
-            console.print(f"[green]Generated embeddings for {count} entries[/green]")
-        except ImportError:
-            console.print("[red]Error:[/red] Install semantic extras: pip install pyrite[semantic]")
+    config, db = get_config_and_db()
+    try:
+        if config.get_kb(kb_name) is None:
+            cli_error(
+                f"KB '{kb_name}' not found",
+                error_code="KB_NOT_FOUND",
+                suggestion="run `pyrite-admin kb list` to see registered KBs",
+            )
+        if unavailable := semantic_unavailable_for(db):
+            # The same cause and remedy `pyrite index embed` gives.
+            _, cause, remedy = unavailable
+            cli_error(
+                cause[0].upper() + cause[1:] + ".",
+                error_code="DEPENDENCY_MISSING",
+                suggestion=remedy,
+            )
+        # This called `embed_kb`, which EmbeddingService has never had; the
+        # ImportError arm hid that from every run without the extra.
+        stats = EmbeddingService(db, model_name=config.settings.embedding_model).embed_all(
+            kb_name=kb_name
+        )
+    finally:
+        db.close()
+    console.print(
+        f"[green]Embedded {stats['embedded']} entries[/green] ({stats['skipped']} already had a vector)"
+    )
+    if stats["errors"]:
+        console.print(f"[red]Errors: {stats['errors']}[/red] (still owed an embedding)")
+    # The same batch rule as `pyrite index embed` (#526).
+    exit_unless_whole(stats["errors"], stats["embedded"] + stats["skipped"])
 
 
 @index_app.command("health")
 def index_health():
     """Check index health and consistency."""
     from .cli.context import index_db_context
-    from .storage import IndexManager
+    from .services.kb_service import KBService
 
     config = load_config()
     with index_db_context(config) as db:
-        index_mgr = IndexManager(db, config)
+        kb_svc = KBService(config, db)
 
-        health = index_mgr.check_health()
+        health = kb_svc.check_index_health()
         is_healthy = not (
             health["missing_files"] or health["unindexed_files"] or health["stale_entries"]
         )
@@ -271,6 +317,7 @@ def index_health():
                 console.print(f"  Unindexed files: {len(health['unindexed_files'])}")
             if health["stale_entries"]:
                 console.print(f"  Stale entries: {len(health['stale_entries'])}")
+            raise typer.Exit(1)  # as `pyrite index health` does (#526)
 
 
 # =============================================================================
@@ -318,7 +365,17 @@ def repo_sync(repo_name: str = typer.Argument(..., help="Repository name")):
     with index_db_context(config) as db:
         svc = RepoService(config, db)
         result = svc.sync(repo_name)
-        console.print(f"[green]Synced:[/green] {repo_name} ({result.get('status', 'ok')})")
+    # `sync` reports failure inside its result, not as an exception (#526).
+    if not result.get("success"):
+        cli_error(result.get("error", "Unknown error"), error_code="SYNC_FAILED", retryable=True)
+    repos = result.get("repos", {})
+    for name, info in repos.items():
+        if info["success"]:
+            console.print(f"[green]Synced:[/green] {name} ({info.get('message', 'ok')})")
+        else:
+            console.print(f"[red]{name}:[/red] {info['error']}")
+    failed = sum(1 for info in repos.values() if not info["success"])
+    exit_unless_whole(failed, len(repos) - failed)
 
 
 @repo_app.command("unsubscribe")
@@ -330,8 +387,10 @@ def repo_unsubscribe(repo_name: str = typer.Argument(..., help="Repository name"
     config = load_config()
     with index_db_context(config) as db:
         svc = RepoService(config, db)
-        svc.unsubscribe(repo_name)
-        console.print(f"[green]Unsubscribed:[/green] {repo_name}")
+        result = svc.unsubscribe(repo_name)
+    if not result.get("success"):  # reported in the result, not raised (#526)
+        cli_error(result.get("error", "Unknown error"), error_code="NOT_FOUND")
+    console.print(f"[green]Unsubscribed:[/green] {repo_name}")
 
 
 @repo_app.command("status")

@@ -349,9 +349,11 @@ def scan(kb_config: KBConfig) -> IdScan:
             result.skipped.append({"path": rel, "reason": "no YAML frontmatter"})
             continue
         meta = parsed[0]
-        current = repo.id_of_file(path)
+        current, why = repo.read_id(path)
         if current is None:
-            result.skipped.append({"path": rel, "reason": "Pyrite cannot read an id from it"})
+            result.skipped.append(
+                {"path": rel, "reason": why or "Pyrite cannot read an id from it"}
+            )
             continue
         explicit = id_text(meta.get("id")) is not None
         if not explicit:

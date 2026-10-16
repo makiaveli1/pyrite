@@ -10,6 +10,7 @@ from rich.table import Table
 
 from ..services.access_policy import UNSCOPED
 from .context import cli_context
+from .output import output_format_choice, validate_output_format
 
 qa_app = typer.Typer(help="Quality assurance validation and assessment")
 console = Console()
@@ -26,7 +27,10 @@ def qa_validate(
     kb_name: str | None = typer.Argument(None, help="KB to validate (all if omitted)"),
     entry: str | None = typer.Option(None, "--entry", "-e", help="Validate single entry by ID"),
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
     severity: str | None = typer.Option(
         None, "--severity", "-s", help="Minimum severity filter: error, warning, info"
@@ -112,7 +116,13 @@ def qa_validate(
 def qa_assess(
     kb_name: str = typer.Argument(..., help="KB to assess"),
     entry: str | None = typer.Option(None, "--entry", "-e", help="Assess single entry by ID"),
-    tier: int = typer.Option(1, "--tier", "-t", help="Assessment tier (1=structural)"),
+    tier: int = typer.Option(
+        1,
+        "--tier",
+        "-t",
+        help="Assessment tier: 1=structural; 2=structural plus the model-judged rubric "
+        "(needs a configured model, else refused with AI_NOT_CONFIGURED)",
+    ),
     max_age: int = typer.Option(
         24, "--max-age", help="Skip entries assessed within N hours (0 = reassess all)"
     ),
@@ -120,41 +130,62 @@ def qa_assess(
         False, "--create-tasks", help="Create tasks for failed assessments"
     ),
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """Run QA assessment on entries, creating assessment records.
 
     Assesses entry quality and creates qa_assessment entries in the KB.
     Use --create-tasks to auto-generate tasks for failures.
+
+    A tier that does not run records nothing: an unknown tier, or tier 2 with
+    no model, is refused; a single entry the model did not answer for is
+    refused with EVALUATION_FAILED; a KB run lists such entries under
+    `failed`, and tasks it could not create under `tasks_failed`.
     """
+    from ..exceptions import PyriteError
+    from ..services.llm_service import LLMService
     from ..services.qa_service import QAService
+    from ..utils.errors import cli_error_from
 
     with cli_context() as (config, db, svc):
-        qa = QAService(config, db)
+        # The model is wired as `ci` and MCP wire it; tier 2 is refused when
+        # it is not configured (QAService.require_tier).
+        qa = QAService(config, db, llm_service=LLMService(config.settings) if tier >= 2 else None)
+
+        try:
+            if entry:
+                result = qa.assess_entry(
+                    entry,
+                    kb_name,
+                    tier=tier,
+                    create_task_on_fail=create_tasks,
+                    readable_kbs=UNSCOPED,
+                )
+            else:
+                result = qa.assess_kb(
+                    kb_name,
+                    tier=tier,
+                    max_age_hours=max_age,
+                    create_task_on_fail=create_tasks,
+                    readable_kbs=UNSCOPED,
+                )
+        except PyriteError as exc:
+            cli_error_from(exc, output_format)
 
         if entry:
-            result = qa.assess_entry(
-                entry,
-                kb_name,
-                tier=tier,
-                create_task_on_fail=create_tasks,
-                readable_kbs=UNSCOPED,
-            )
             data = {
                 "assessment_id": result["assessment_id"],
                 "target_entry": result["target_entry"],
                 "qa_status": result["qa_status"],
                 "issues_found": result["issues_found"],
             }
+            if "task_failed" in result:
+                data["task_failed"] = result["task_failed"]
         else:
-            result = qa.assess_kb(
-                kb_name,
-                tier=tier,
-                max_age_hours=max_age,
-                create_task_on_fail=create_tasks,
-                readable_kbs=UNSCOPED,
-            )
             data = {
                 "kb_name": result["kb_name"],
                 "assessed": result["assessed"],
@@ -168,11 +199,23 @@ def qa_assess(
                     }
                     for r in result["results"]
                 ],
+                "failed": result["failed"],
+                "tasks_failed": result["tasks_failed"],
             }
 
         formatted = _format_output(data, output_format)
         if formatted is not None:
             typer.echo(formatted)
+            if output_format in ("csv", "markdown"):
+                # These formats render `results` only; what was not assessed,
+                # and tasks not created, still reach the reader (#795).
+                for f in data.get("failed", []):
+                    typer.echo(
+                        f"not assessed: {f['entry_id']}: {f['error_code']}: {f['reason']}",
+                        err=True,
+                    )
+                for t in data.get("tasks_failed", []):
+                    typer.echo(f"task not created: {t['entry_id']}: {t['reason']}", err=True)
             return
 
         # Rich output
@@ -207,13 +250,24 @@ def qa_assess(
                         str(r["issues_found"]),
                     )
                 console.print(table)
+            for f in result["failed"]:
+                console.print(
+                    f"  [red]not assessed[/red] {f['entry_id']}: {f['error_code']}: {f['reason']}"
+                )
+        for t in result.get("tasks_failed") or (
+            [result["task_failed"]] if "task_failed" in result else []
+        ):
+            console.print(f"  [red]task not created[/red] for {t['entry_id']}: {t['reason']}")
 
 
 @qa_app.command("status")
 def qa_status(
     kb_name: str | None = typer.Argument(None, help="KB to check (all if omitted)"),
     output_format: str = typer.Option(
-        "json", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "json",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """Show QA status dashboard with issue counts and coverage."""
@@ -266,7 +320,12 @@ def qa_checkers(
     kb_name: str | None = typer.Option(
         None, "--kb", "-k", help="Show rubric coverage for a specific KB"
     ),
-    output_format: str = typer.Option("rich", "--format", help="Output format: json, rich"),
+    output_format: str = typer.Option(
+        "rich",
+        "--format",
+        callback=output_format_choice("json", "rich"),
+        help="Output format: json, rich",
+    ),
 ):
     """List available rubric checkers and per-KB coverage.
 
@@ -421,7 +480,12 @@ def qa_gaps(
     threshold: int = typer.Option(
         3, "--threshold", "-t", help="Minimum entries per type to not flag as sparse"
     ),
-    output_format: str = typer.Option("rich", "--format", help="Output format: json, rich"),
+    output_format: str = typer.Option(
+        "rich",
+        "--format",
+        callback=output_format_choice("json", "rich"),
+        help="Output format: json, rich",
+    ),
 ):
     """Report structural coverage gaps in a KB.
 
@@ -537,7 +601,12 @@ def qa_fix(
         "--fix-rule",
         help="Only fix specific rule types (e.g. invalid_date, broken_link, tag_case)",
     ),
-    output_format: str = typer.Option("rich", "--format", help="Output format: json, rich"),
+    output_format: str = typer.Option(
+        "rich",
+        "--format",
+        callback=output_format_choice("json", "rich"),
+        help="Output format: json, rich",
+    ),
 ):
     """Auto-fix safe structural issues found by validation.
 
@@ -582,8 +651,25 @@ def qa_fix(
                     f.get("message", ""),
                 )
             console.print(table)
-        else:
+        elif not result["failed"]:
             console.print("\n[green]No fixable issues found.[/green]")
+
+        # Failed: the fix was attempted and its write did not land (#788)
+        if result["failed"]:
+            console.print(f"\n[bold red]Failed ({result['failed_count']}):[/bold red]")
+            table = Table()
+            table.add_column("Entry", style="cyan")
+            table.add_column("Rule", style="dim")
+            table.add_column("Change")
+            table.add_column("Reason", style="red")
+            for f in result["failed"]:
+                table.add_row(
+                    f.get("entry_id", ""),
+                    f.get("rule", ""),
+                    f.get("message", ""),
+                    f.get("reason", ""),
+                )
+            console.print(table)
 
         # Manual
         if result["manual"]:
@@ -614,6 +700,7 @@ def qa_fix(
         # Summary
         console.print(
             f"\n[bold]Summary:[/bold] {result['fixed_count']} fixed, "
+            f"{result['failed_count']} failed, "
             f"{result['manual_count']} manual, {result['skipped_count']} skipped"
         )
 
@@ -628,7 +715,10 @@ def qa_stale(
         90, "--max-age", "-a", help="Days since last update to consider stale"
     ),
     output_format: str = typer.Option(
-        "rich", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "rich",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """Find entries that haven't been updated recently.
@@ -678,7 +768,10 @@ def qa_compact(
     kb_name: str = typer.Argument(..., help="KB to check for archival candidates"),
     min_age: int = typer.Option(90, "--min-age", "-a", help="Minimum days old to be a candidate"),
     output_format: str = typer.Option(
-        "rich", "--format", help="Output format: json, rich, markdown, csv, yaml"
+        "rich",
+        "--format",
+        callback=validate_output_format,
+        help="Output format: json, rich, markdown, csv, yaml",
     ),
 ):
     """Find entries that are candidates for archival.
@@ -740,7 +833,12 @@ def qa_check_urls(
     kb_name: str = typer.Argument(..., help="KB to check source URLs"),
     sample: int = typer.Option(0, "--sample", "-s", help="Check a random sample of N URLs (0=all)"),
     cache_file: str = typer.Option("", "--cache", help="Path to URL check cache file"),
-    output_format: str = typer.Option("rich", "--format", help="Output format: json, rich"),
+    output_format: str = typer.Option(
+        "rich",
+        "--format",
+        callback=output_format_choice("json", "rich"),
+        help="Output format: json, rich",
+    ),
 ):
     """Check source URLs for liveness (HTTP status).
 
@@ -817,7 +915,12 @@ def qa_coverage(
     entry_type: str | None = typer.Option(
         None, "--type", "-t", help="Restrict report to one entry type"
     ),
-    output_format: str = typer.Option("rich", "--format", help="Output format: rich or json"),
+    output_format: str = typer.Option(
+        "rich",
+        "--format",
+        callback=output_format_choice("json", "rich"),
+        help="Output format: rich or json",
+    ),
 ):
     """Curation coverage stats for a KB.
 

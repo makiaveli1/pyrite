@@ -825,7 +825,11 @@ def test_oracle_matches_live_hugo(row, tmp_path):
     )
     (tmp_path / "content/p.md").write_bytes(text.encode())
     r = subprocess.run(
-        ["hugo", "--quiet", "-d", "out"], cwd=tmp_path, capture_output=True, text=True
+        ["hugo", "--quiet", "-d", "out"],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     out = tmp_path / "out/p/index.html"
     if r.returncode or not out.exists():
@@ -906,14 +910,13 @@ def _readers(tmp_path, kb_service):
         return ("refused", "None") if e is None else ("loaded", e.title, e.body)
 
     def create(text):
-        import click
-        import typer
-
         from pyrite.cli.entry_commands import _body_frontmatter
+        from pyrite.exceptions import ValidationError
 
         try:
             meta, body = _body_frontmatter(text)
-        except (click.exceptions.Exit, typer.Exit, SystemExit):
+        except ValidationError:
+            # The helper refuses by raising; the root prints it (ADR-0046).
             return ("refused", "exit")
         # `type`/`title` stay in the body's YAML only when the helper returns them: it drops them.
         if body == text:

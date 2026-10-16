@@ -376,7 +376,12 @@ class TestPytestArgs:
 
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(
-        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+        ["git", *args],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
     ).stdout
 
 
@@ -441,6 +446,7 @@ class TestBaseFallback:
             [sys.executable, str(SCRIPT), "--root", str(repo), "--list", "--committed"],
             capture_output=True,
             text=True,
+            timeout=120,
         )
         assert out.returncode == 0, out.stderr
         assert "tests/test_b.py" in out.stdout.split()
@@ -471,6 +477,7 @@ class TestPushedRange:
             capture_output=True,
             text=True,
             env={**os.environ, **env},
+            timeout=120,
         )
 
     def test_selects_the_pushed_range_not_the_working_tree(self, pushed):
@@ -506,6 +513,7 @@ class TestNoBase:
             [sys.executable, str(SCRIPT), "--root", str(repo), "--run", "--dry-run"],
             capture_output=True,
             text=True,
+            timeout=120,
         )
         assert out.returncode != 0
         assert "Traceback" not in out.stderr
@@ -518,6 +526,7 @@ class TestCLI:
             [sys.executable, str(SCRIPT), "--root", str(repo), *args],
             capture_output=True,
             text=True,
+            timeout=120,
         )
 
     def test_list_prints_selected_paths(self, repo):
@@ -637,6 +646,10 @@ class TestThisRepository:
         "tests/test_entry_lifecycle.py",
         # the KB service
         "tests/test_services.py::TestKBService",
+        # authentication, including refusal and session verification
+        "tests/test_auth_service.py::TestLogin::test_login_success",
+        "tests/test_auth_service.py::TestLogin::test_login_wrong_password",
+        "tests/test_auth_service.py::TestSessions::test_verify_session_valid",
         # auth / read scoping, and every entry point passing the policy (ADR-0037 §5)
         "tests/test_read_scoping_is_structural.py",
         "tests/test_every_entry_point_passes_the_policy.py",
@@ -650,6 +663,8 @@ class TestThisRepository:
         "tests/test_cli_commands.py::TestTyperListCommand",
         "tests/test_cli_commands.py::TestTyperGetCommand",
         "tests/test_cli_commands.py::TestTyperCreateCommand",
+        "tests/test_cli_commands.py::test_index_sync_verify_finds_same_size_edit_with_restored_mtime",
+        "tests/test_cli_commands.py::test_index_sync_verify_rejects_background_mode",
         "tests/test_cli_commands.py::TestTopLevelHelpAdvertisesOrient",
     }
 
