@@ -135,9 +135,7 @@ def _tree(root: Path) -> dict[str, bytes | None]:
     """
     snapshot = {}
     for path in sorted(root.rglob("*")):
-        snapshot[path.relative_to(root).as_posix()] = (
-            path.read_bytes() if path.is_file() else None
-        )
+        snapshot[path.relative_to(root).as_posix()] = path.read_bytes() if path.is_file() else None
     return snapshot
 
 
