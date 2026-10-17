@@ -239,4 +239,49 @@ test.describe('Entry Detail Page', () => {
 		const breadcrumbs = page.locator('header').getByRole('navigation');
 		await expect(breadcrumbs.getByRole('link', { name: 'Entries' })).toHaveAttribute('href', '/entries');
 	});
+
+	// The two ways a reader destroys an entry without reading the prompt. Both
+	// are timing, not intent, so both need a real browser: jsdom fires no
+	// keydown-to-click default action, so the component test can only pin the
+	// mechanism (focus lands on the inert step, not on Confirm).
+	test('a double-click and an Enter-Enter on Delete cannot delete the entry', async ({
+		page,
+		request
+	}) => {
+		const title = uniqueTitle('E2E Crud Delete Guard');
+		const id = idForTitle(title);
+		try {
+			await page.goto('/entries/new');
+			await page.getByLabel('Title').fill(title);
+			await page.getByTestId('template-blank').click();
+			await page.getByRole('button', { name: 'Create' }).click();
+			await expect(page).toHaveURL(new RegExp(`/entries/${id}\\?kb=${E2E_KB}$`), {
+				timeout: COLD_ROUTE_TIMEOUT
+			});
+
+			const del = page.getByRole('button', { name: 'Delete' });
+
+			// Double-click: the second click lands on a disabled Delete.
+			await del.dblclick();
+			await expect(page.getByRole('button', { name: 'Confirm delete' })).toBeVisible();
+
+			// Enter-Enter: focus starts on Delete. The first Enter opens the
+			// step and focus moves to it, so the second Enter presses nothing.
+			await page.getByRole('button', { name: 'Cancel' }).click();
+			await expect(del).toBeEnabled();
+			await del.focus();
+			await page.keyboard.press('Enter');
+			await page.keyboard.press('Enter');
+
+			// Still on the entry, still not deleted.
+			await expect(page).toHaveURL(new RegExp(`/entries/${id}\\?kb=${E2E_KB}$`));
+			await expect(page.getByRole('heading', { name: title, level: 1 })).toBeVisible();
+			const stillThere = await request.get(
+				`${API_BASE}/api/entries/${encodeURIComponent(id)}?kb=${E2E_KB}`
+			);
+			expect(stillThere.ok()).toBe(true);
+		} finally {
+			await deleteEntry(request, id);
+		}
+	});
 });

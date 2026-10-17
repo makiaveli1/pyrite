@@ -297,12 +297,16 @@
 											entryId={entryStore.current?.id ?? ''}
 											kbName={entryStore.current?.kb_name ?? ''}
 											entryTitle={entryStore.current?.title ?? ''}
-										onDeleted={() => {
-											// The reader deleted in this KB; land back in the same
-											// one, not in whatever KB the entries list defaults to.
-											const kb = entryStore.current?.kb_name ?? '';
-											goto(kb ? `/entries?kb=${encodeURIComponent(kb)}` : '/entries');
-										}}
+											onDeleted={(deletedFrom) => {
+												// The KB the delete request named, not a re-read of the
+												// store afterwards: land back in the KB the reader
+												// deleted from, not in whatever the list defaults to.
+												goto(
+													deletedFrom
+														? `/entries?kb=${encodeURIComponent(deletedFrom)}`
+														: '/entries'
+												);
+											}}
 										/>
 									{/if}
 										{#if editing}

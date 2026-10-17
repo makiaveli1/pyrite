@@ -37,10 +37,16 @@ afterEach(() => {
 	vi.clearAllMocks();
 });
 
-function setup() {
+function setup(overrides: { kbName?: string } = {}) {
 	const onDeleted = vi.fn();
 	render(DeleteEntryButton, {
-		props: { entryId: 'hub', kbName: 'demo', entryTitle: 'Hub Design', onDeleted }
+		props: {
+			entryId: 'hub',
+			kbName: 'demo',
+			entryTitle: 'Hub Design',
+			onDeleted,
+			...overrides
+		}
 	});
 	return { onDeleted };
 }
@@ -79,19 +85,53 @@ describe('DeleteEntryButton', () => {
 		expect(screen.getByText(/demo/)).toBeInTheDocument();
 	});
 
-	it('confirm calls deleteEntry with the entry id and kb, then calls onDeleted', async () => {
+	it('keeps the KB readable and carries the full value in title', async () => {
+		setup({ kbName: 'a-very-long-knowledge-base-name-that-would-be-cut-off' });
+		await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+		const kb = screen.getByText('a-very-long-knowledge-base-name-that-would-be-cut-off');
+		// The KB is named outside the truncating element, so a long one is
+		// still announced in full rather than cut to an ellipsis.
+		expect(kb).toHaveAttribute('title', 'a-very-long-knowledge-base-name-that-would-be-cut-off');
+		expect(kb.className).not.toContain('truncate');
+	});
+
+	it('opens the step with focus on the prompt, never on Confirm', async () => {
+		setup();
+		const del = screen.getByRole('button', { name: 'Delete' });
+		await fireEvent.click(del);
+		// Enter-Enter is the hazard: if focus landed on Confirm, the reader's
+		// second Enter would delete the entry without reading the prompt. The
+		// step is not actionable, so Enter there does nothing.
+		expect(document.activeElement).not.toBe(
+			screen.getByRole('button', { name: 'Confirm delete' })
+		);
+		expect(document.activeElement).toHaveAccessibleName('Confirm deleting this entry');
+	});
+
+	it('keeps the confirm step out of the toolbar flow', async () => {
+		setup();
+		await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
+		const step = screen.getByRole('group', { name: 'Confirm deleting this entry' });
+		// Absolutely positioned, so opening the step cannot reflow the row the
+		// reader is on. The Delete button's own box is unchanged.
+		expect(step.className).toContain('absolute');
+	});
+
+	it('confirm calls deleteEntry with the entry id and kb, then hands that kb back', async () => {
 		const { onDeleted } = setup();
 		mockDeleteEntry.mockResolvedValue({ deleted: true, id: 'hub' });
 		await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
 		await fireEvent.click(screen.getByRole('button', { name: 'Confirm delete' }));
 		await waitFor(() => expect(onDeleted).toHaveBeenCalledTimes(1));
 		expect(mockDeleteEntry).toHaveBeenCalledWith('hub', 'demo');
+		// The KB the request named, so the caller navigates to the KB the entry
+		// was actually removed from.
+		expect(onDeleted).toHaveBeenCalledWith('demo');
 	});
 
 	it('cancel sends no request, restores Delete, and returns focus to it', async () => {
 		setup();
 		await fireEvent.click(screen.getByRole('button', { name: 'Delete' }));
-		expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Confirm delete' }));
 		await fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
 		expect(mockDeleteEntry).not.toHaveBeenCalled();
 		const del = screen.getByRole('button', { name: 'Delete' });
