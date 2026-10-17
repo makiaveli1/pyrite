@@ -30,6 +30,9 @@ FILES = {
     "nan.md": "---\ntype: note\ntitle: .nan\n---\nbody\n",
     # An explicit id does not make an unindexable title indexable.
     "id-list.md": "---\nid: pinned\ntype: note\ntitle: [a, b]\n---\nbody\n",
+    # Frontmatter that will not parse at all. There is no title to judge here,
+    # and one such file must not take the whole KB-wide pass down with it.
+    "unparseable.md": "---\ntype: note\ntitle: [a, b\n---\nbody\n",
 }
 
 
@@ -77,10 +80,22 @@ def test_validate_kb_says_which_kind_of_title_it_is(kb):
     assert any("title is NaN" in m for m in messages)
 
 
-def test_indexing_skips_the_unindexable_titles_cleanly(kb):
+def test_a_file_whose_frontmatter_will_not_parse_does_not_stop_the_run(kb):
     config, db, _svc, _repo = kb
-    # A file whose title cannot load is skipped by the index path with a
-    # named reason, not a sqlite ProgrammingError traceback (#711).
+    qa = QAService(config, db)
+    # `title: [a, b` never parses, so there is no title to judge and the
+    # malformed-file rule is the one that reports it. What must not happen is
+    # the exception escaping and the rest of the KB going unreported.
+    result = qa.validate_kb(KB, readable_kbs=UNSCOPED)
+    findings = [i for i in result["issues"] if i["rule"] == "non_string_title"]
+    reported = {i["message"].split(":")[0] for i in findings}
+    assert reported == {"list.md", "dict.md", "nan.md", "id-list.md"}
+
+
+def test_the_index_holds_only_the_file_whose_title_loads(kb):
+    config, db, _svc, _repo = kb
+    # Asserts the row set: a file whose title cannot load is skipped by the
+    # index path, and so is one whose frontmatter will not parse.
     IndexManager(db, config).index_kb(KB)
     rows = {r["id"]: r for r in db.list_entries(kb_name=KB)}
     assert set(rows) == {"fine"}

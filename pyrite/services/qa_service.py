@@ -1219,6 +1219,7 @@ class QAService:
         at load (#704) and is not reported here. The path in the message is the
         handle to use: no index row exists for such a file.
         """
+        from ..exceptions import FrontmatterError
         from ..utils.frontmatter import Frontmatter, split_frontmatter
         from ..utils.yaml import load_yaml
 
@@ -1230,7 +1231,15 @@ class QAService:
             split = split_frontmatter(text)
             if not isinstance(split, Frontmatter):
                 continue
-            fm = load_yaml(split.text)
+            try:
+                fm = load_yaml(split.text)
+            except FrontmatterError:
+                # Frontmatter that will not parse (`title: [a, b`) has no title
+                # to judge, and the malformed-file rule already reports it. Left
+                # unhandled it aborts the whole KB-wide pass over one bad file,
+                # so the rest of the KB goes unreported.
+                logger.debug("non-string title check: skipping %s", file_path, exc_info=True)
+                continue
             if not isinstance(fm, dict) or "title" not in fm:
                 continue
             title = fm["title"]
