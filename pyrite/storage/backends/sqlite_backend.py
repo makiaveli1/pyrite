@@ -38,9 +38,10 @@ def _as_stored_text(value: Any) -> str:
     matched the stored row, and each re-index inserted another copy of it
     (#927). Same rule as ``index._as_text``; duplicated rather than imported
     because a backend must not depend on the index manager above it.
+
+    ``None`` is not coerced: a ``target:`` that YAML read as null is refused,
+    not stored, and folding it into ``""`` would make it storable.
     """
-    if value is None:
-        return ""
     if isinstance(value, bool):
         return str(int(value))
     return value if isinstance(value, str) else str(value)
@@ -209,7 +210,14 @@ class SQLiteBackend(BaseBackend):
         for link in links:
             relation = link.get("relation", "related_to")
             target_kb = link.get("kb", kb_name)
-            target_id = _as_stored_text(link.get("target", ""))
+            # Keyed as the TEXT the row will hold, so a hand file's
+            # `target: 2024` meets the row an earlier sync stored for it
+            # (#927). An explicit null target stays None so the refusal the
+            # index already gives it is unchanged; a *missing* target key is
+            # "" and stays storable.
+            target_id = link.get("target", "")
+            if target_id is not None:
+                target_id = _as_stored_text(target_id)
             key = (target_id, target_kb, relation)
             desired[key] = {
                 "note": link.get("note", ""),
