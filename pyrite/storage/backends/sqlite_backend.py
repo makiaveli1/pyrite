@@ -28,20 +28,32 @@ from .protocol import DEFAULT_MIN_SIMILARITY, SemanticRows, similarity_from
 _SQLITE_VEC_MAX_K = 4096
 
 
-def _as_stored_text(value: Any) -> str:
-    """``value`` as this TEXT column will hold it once SQLite has stored it.
+def _as_stored_text(value: Any) -> Any:
+    """A link field as the TEXT its column holds, for keying the sync diff.
 
-    A hand file's link ``target`` is whatever YAML read: ``target: 2024`` is an
-    int and ``target: true`` is a bool, while the column is TEXT, so the driver
-    coerces on the way in (True -> ``'1'``, 1.5 -> ``'1.5'``, a date ->
-    ``'2024-01-01'``). Keying the link diff by the raw value therefore never
-    matched the stored row, and each re-index inserted another copy of it
-    (#927). Same rule as ``index._as_text``; duplicated rather than imported
-    because a backend must not depend on the index manager above it.
+    A hand file's link fields are whatever YAML read: ``target: 2024`` and
+    ``relation: true`` are an int and a bool, while the columns are TEXT. The
+    raw value therefore never matched the stored row, so a re-index deleted
+    and re-inserted it on every pass, and two spellings that store alike
+    (``2024`` and ``'2024'``) never collapsed into one link (#927).
 
-    ``None`` is not coerced: a ``target:`` that YAML read as null is refused,
-    not stored, and folding it into ``""`` would make it storable.
+    The text is not always what the driver would have bound -- a datetime
+    binds with ``T``, ``1e20`` as ``1.0e+20``, ``inf`` as ``Inf``. That does not
+    matter here: the insert binds this converted value, so the text written is
+    the text compared. What has to hold is that both sides of the diff come
+    from the same call, and they do.
+
+    ``None`` and collections pass through unchanged, because both are refused by
+    the write rather than stored: a ``target:`` that YAML read as null, and a
+    ``relation:`` or ``kb:`` that is a list or a mapping. Stringifying either
+    would make it storable, which is the opposite of what the index already
+    does with them.
+
+    Same rule as ``index._as_text``; duplicated rather than imported because a
+    backend must not depend on the index manager above it.
     """
+    if value is None or isinstance(value, (list, tuple, dict)):
+        return value
     if isinstance(value, bool):
         return str(int(value))
     return value if isinstance(value, str) else str(value)
@@ -204,23 +216,20 @@ class SQLiteBackend(BaseBackend):
         from ...schema import get_inverse_relation
 
         # Build desired state as a dict keyed by (target_id, target_kb, relation).
-        # The target is keyed as the TEXT the row will hold, so a hand file's
-        # `target: 2024` meets the row an earlier sync stored for it (#927).
+        # Every part of the key is keyed as the TEXT its column holds, and the
+        # note with it: `target: 2024` has to meet the row an earlier sync
+        # stored for it, and `relation: true` and `kb: 2024` churned the same
+        # way (#927). An explicit null stays None, so the refusals the index
+        # already gave it are unchanged; a *missing* key is "" and stays
+        # storable.
         desired: dict[tuple[str, str, str], dict[str, Any]] = {}
         for link in links:
-            relation = link.get("relation", "related_to")
-            target_kb = link.get("kb", kb_name)
-            # Keyed as the TEXT the row will hold, so a hand file's
-            # `target: 2024` meets the row an earlier sync stored for it
-            # (#927). An explicit null target stays None so the refusal the
-            # index already gives it is unchanged; a *missing* target key is
-            # "" and stays storable.
-            target_id = link.get("target", "")
-            if target_id is not None:
-                target_id = _as_stored_text(target_id)
+            relation = _as_stored_text(link.get("relation", "related_to"))
+            target_kb = _as_stored_text(link.get("kb", kb_name))
+            target_id = _as_stored_text(link.get("target", ""))
             key = (target_id, target_kb, relation)
             desired[key] = {
-                "note": link.get("note", ""),
+                "note": _as_stored_text(link.get("note", "")),
                 "inverse_relation": get_inverse_relation(relation),
             }
 

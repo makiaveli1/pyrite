@@ -447,6 +447,55 @@ class TestHandFileLinkTargets:
 
         assert counts == [1, 1, 1], f"link rows grew across re-index: {counts}"
 
+    @pytest.mark.parametrize(
+        ("label", "links_yaml"),
+        [
+            ("bool_relation", "- target: fresh\n  relation: true\n"),
+            ("int_kb", "- target: fresh\n  relation: related_to\n  kb: 2024\n"),
+            ("float_relation", "- target: fresh\n  relation: 1.5\n"),
+            ("int_note", "- target: fresh\n  relation: related_to\n  note: 5\n"),
+        ],
+        ids=lambda v: v if isinstance(v, str) else "",
+    )
+    def test_a_non_string_relation_kb_or_note_also_matches_in_place(
+        self, hand_file_kb, label, links_yaml
+    ):
+        """The other two key parts and the note are YAML-typed too. Before they
+        were coerced, `relation: true` and `kb: 2024` churned the row on every
+        sync and `note: 5` was rewritten every pass (#927 review)."""
+        db, kb_path, config = hand_file_kb
+        _write_hand_file(kb_path, links_yaml)
+
+        IndexManager(db, config).index_kb("test")
+        first = self._link_rows(db)
+        assert len(first) == 1, label
+        first_id = first[0].id
+        first_note = first[0].note
+
+        IndexManager(db, config).index_kb("test")
+        after = self._link_rows(db)
+        assert len(after) == 1, f"{label}: row count changed"
+        assert after[0].id == first_id, f"{label}: row was rewritten instead of matched"
+        assert after[0].note == first_note, f"{label}: note was rewritten"
+
+    def test_int_relation_and_its_quoted_twin_collapse_to_one_link(self, hand_file_kb):
+        """`relation: 1` beside `relation: '1'` is one key once stored, so one
+        row, the same way two spellings of a target collapse (#927 review)."""
+        db, kb_path, config = hand_file_kb
+        _write_hand_file(
+            kb_path,
+            "- target: fresh\n  relation: 1\n- target: fresh\n  relation: '1'\n",
+        )
+
+        IndexManager(db, config).index_kb("test")
+        assert len(self._link_rows(db)) == 1
+        first_id = self._link_rows(db)[0].id
+
+        IndexManager(db, config).index_kb("test")
+        rows = self._link_rows(db)
+        assert len(rows) == 1, f"link rows grew across re-index: {len(rows)}"
+        assert rows[0].id == first_id
+
     def test_removing_the_link_removes_every_row(self, hand_file_kb):
         """The spares a duplicate key leaves behind go when the link does."""
         db, kb_path, config = hand_file_kb
