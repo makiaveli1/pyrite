@@ -27,6 +27,25 @@ from .protocol import DEFAULT_MIN_SIMILARITY, SemanticRows, similarity_from
 #: cap, or when distance culling removes candidates (#56, #194).
 _SQLITE_VEC_MAX_K = 4096
 
+
+def _as_stored_text(value: Any) -> str:
+    """``value`` as this TEXT column will hold it once SQLite has stored it.
+
+    A hand file's link ``target`` is whatever YAML read: ``target: 2024`` is an
+    int and ``target: true`` is a bool, while the column is TEXT, so the driver
+    coerces on the way in (True -> ``'1'``, 1.5 -> ``'1.5'``, a date ->
+    ``'2024-01-01'``). Keying the link diff by the raw value therefore never
+    matched the stored row, and each re-index inserted another copy of it
+    (#927). Same rule as ``index._as_text``; duplicated rather than imported
+    because a backend must not depend on the index manager above it.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return str(int(value))
+    return value if isinstance(value, str) else str(value)
+
+
 # ``non_empty`` (#200): an entry has something to show when its body or its
 # summary holds a character other than space, tab, CR or LF. SQLite's TRIM
 # takes a one-space default, so the set is spelled out. No length threshold.
@@ -183,12 +202,14 @@ class SQLiteBackend(BaseBackend):
     def _sync_links(self, entry_id: str, kb_name: str, links: list[dict[str, Any]]) -> None:
         from ...schema import get_inverse_relation
 
-        # Build desired state as a dict keyed by (target_id, target_kb, relation)
+        # Build desired state as a dict keyed by (target_id, target_kb, relation).
+        # The target is keyed as the TEXT the row will hold, so a hand file's
+        # `target: 2024` meets the row an earlier sync stored for it (#927).
         desired: dict[tuple[str, str, str], dict[str, Any]] = {}
         for link in links:
             relation = link.get("relation", "related_to")
             target_kb = link.get("kb", kb_name)
-            target_id = link.get("target", "")
+            target_id = _as_stored_text(link.get("target", ""))
             key = (target_id, target_kb, relation)
             desired[key] = {
                 "note": link.get("note", ""),
@@ -201,18 +222,18 @@ class SQLiteBackend(BaseBackend):
         existing_keys: dict[tuple[str, str, str], Link] = {}
         for row in existing:
             key = (row.target_id, row.target_kb, row.relation)
-            existing_keys[key] = row
+            # First row wins the slot: a hand file can hold both `target: 2024`
+            # and `target: '2024'`, which are one key once stored, and the
+            # spares are deleted below rather than left to accumulate (#927).
+            existing_keys.setdefault(key, row)
 
-        # Delete links no longer in desired set
-        for key, row in existing_keys.items():
-            if key not in desired:
-                self._session.delete(row)
-
-        # Add new links and update changed ones
+        # Add new links and update changed ones, claiming one existing row each
+        claimed: set[int] = set()
         for key, attrs in desired.items():
             if key in existing_keys:
                 # Update note/inverse if changed
                 row = existing_keys[key]
+                claimed.add(id(row))
                 if row.note != attrs["note"] or row.inverse_relation != attrs["inverse_relation"]:
                     row.note = attrs["note"]
                     row.inverse_relation = attrs["inverse_relation"]
@@ -230,6 +251,16 @@ class SQLiteBackend(BaseBackend):
                         note=attrs["note"],
                     )
                 )
+
+        # Delete links no longer in desired set, and the spares behind a
+        # duplicated key. Iterating the rows rather than the keyed map is what
+        # makes a duplicate reachable at all: two rows sharing a key collapsed
+        # into one dict slot, so the other was never compared and never
+        # deleted, and every sync added another (#927).
+        for row in existing:
+            key = (row.target_id, row.target_kb, row.relation)
+            if key not in desired or id(row) not in claimed:
+                self._session.delete(row)
 
     # =====================================================================
     # Full-text search (FTS5)
