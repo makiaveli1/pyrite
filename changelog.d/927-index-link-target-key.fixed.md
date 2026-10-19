@@ -8,4 +8,4 @@
   a re-index matches the row it wrote last time, two spellings that store alike
   collapse into one link (last note wins, as they already did for identical
   string targets), and a duplicate no longer leaves spares behind. A null field,
-  or one that is a list or a mapping, is still refused rather than stored.
+  or one that is a list or a mapping, is still refused rather than stored. Thanks also to @slophisticated, whose #999 fixed the same issue in parallel.
