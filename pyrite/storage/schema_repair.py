@@ -98,7 +98,7 @@ from pathlib import Path
 
 from sqlalchemy import Column, MetaData
 from sqlalchemy.dialects import sqlite as sqlite_dialect
-from sqlalchemy.schema import CreateColumn, CreateIndex
+from sqlalchemy.schema import CreateColumn, CreateIndex, DefaultClause
 
 from ..exceptions import IndexSchemaRefusedError, StorageBusyError
 from .errors import INDEX_ONLY_STATE, storage_error_from
@@ -194,9 +194,14 @@ def _has_constant_default(column: Column) -> bool:
     Any other SQL expression is treated as non-constant: the repair refuses
     rather than meet SQLite's refusal mid-transaction.
     """
-    if column.server_default is None:
+    default = column.server_default
+    if default is None:
         return True
-    arg = column.server_default.arg
+    if not isinstance(default, DefaultClause):
+        # `FetchedValue` marks a value the database supplies on insert or
+        # update; it emits no DEFAULT in this column's DDL.
+        return True
+    arg = default.arg
     if isinstance(arg, str):
         return True
     sql = getattr(arg, "text", None)
